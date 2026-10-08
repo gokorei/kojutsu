@@ -287,4 +287,9 @@ jobs:
       - name: Install locked dependencies
         run: uv sync --locked --all-extras --dev
       - name: Audit dependencies
-        run: uv run pip-audit --strict --progress-spinner off
+        # No --strict: this audits the installed environment, which always
+        # contains the kojutsu distribution itself, and that distribution is
+        # never on PyPI -- so --strict fails collection permanently rather
+        # than on a signal. Findings still fail the step; the skipped
+        # self-package is listed in the report rather than silently ignored.
+        run: uv run pip-audit --progress-spinner off

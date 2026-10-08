@@ -10,6 +10,7 @@ it is a hole.
 
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -61,6 +62,22 @@ from kojutsu.models import (
 )
 
 runner = CliRunner()
+
+_ANSI_CODE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _operator_text(output: str) -> str:
+    """The text an operator reads, without terminal styling.
+
+    Typer highlights `--options` when it believes the output is a terminal --
+    which, on CI, is always, because `GITHUB_ACTIONS` forces terminal mode --
+    and its highlighter styles a long option in fragments (`-`, `-max`,
+    `-objects`), so the plain option name is not a substring of the styled
+    output. These tests assert on what the operator reads, not on the styling,
+    so they compare against the unstyled text.
+    """
+    return _ANSI_CODE.sub("", output)
+
 
 REPO = "org/repo"
 FLOOR = datetime(2024, 1, 1, tzinfo=UTC)
@@ -341,13 +358,13 @@ def test_the_command_refuses_to_run_without_a_date_floor_or_a_budget() -> None:
     """Both are required, so neither can default to a value this code chose."""
     without_floor = runner.invoke(app, ["backfill-reviews"])
     assert without_floor.exit_code != 0
-    assert "--since" in without_floor.output
+    assert "--since" in _operator_text(without_floor.output)
 
     without_budget = runner.invoke(
         app, ["backfill-reviews", "--since", "2024-01-01", "--repo", REPO]
     )
     assert without_budget.exit_code != 0
-    assert "--max-objects" in without_budget.output
+    assert "--max-objects" in _operator_text(without_budget.output)
 
 
 def _settings(**overrides: object) -> Settings:
@@ -1558,16 +1575,17 @@ def test_the_help_tells_the_operator_what_a_backfill_does_not_do() -> None:
     """Stated where a user meets it, rather than only where it was designed."""
 
     result = runner.invoke(app, ["backfill-reviews", "--help"])
+    text = _operator_text(result.output)
 
     assert result.exit_code == 0
-    assert "does not make the corpus representative" in result.output
-    assert "policy decision" in result.output
-    assert "Answers are not reconstructed" in result.output
-    assert "no cursor file" in result.output
-    assert "Pull requests: Read" in result.output
-    assert "unreadable" in result.output
-    assert "--until" in result.output, "the ceiling has to be discoverable to be used"
-    assert "bounds new work, not reads" in result.output
+    assert "does not make the corpus representative" in text
+    assert "policy decision" in text
+    assert "Answers are not reconstructed" in text
+    assert "no cursor file" in text
+    assert "Pull requests: Read" in text
+    assert "unreadable" in text
+    assert "--until" in text, "the ceiling has to be discoverable to be used"
+    assert "bounds new work, not reads" in text
 
 
 # --- why a review stored nothing is named, not counted ------------------------------
