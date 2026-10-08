@@ -214,7 +214,8 @@ def backfill_reviews(
     nothing to capture, which is what lets a re-run walk past what the last
     one stored instead of spending its budget on it. The forge reads a run
     performs are bounded by the page ceilings rather than by this flag, so a
-    re-run over a range you have already walked re-reads it: what it costs is
+    re-run over a range you have already walked re-lists it and skips the pull
+    requests a finished pass already covered: what it costs is the listing
     reads, and `objects-read` counts every object examined.
 
     It does not make the corpus representative. A backfill removes the
@@ -391,6 +392,7 @@ def _echo_review_backfill_report(plan, report) -> None:
     typer.echo(f"records-written: {report.records_written}")
     typer.echo(f"new-objects: {report.objects_new} (charged against max-objects)")
     typer.echo(f"already-present: {report.already_present}")
+    typer.echo(f"already-finished: {report.skipped_finished}")
     typer.echo(f"unreadable: {report.unreadable}")
     typer.echo(f"silent: {report.silent}")
     for reason, count in report.refusals.items():
@@ -427,7 +429,8 @@ def _echo_review_backfill_report(plan, report) -> None:
         else:
             typer.echo(
                 "  re-run the same range to continue; objects already stored are not charged "
-                "again, so it advances. It does re-read them, so expect reads without records.",
+                "again, so it advances. It skips the pull requests earlier runs finished, "
+                "so expect listing reads without records.",
                 err=True,
             )
     elif report.objects_new == 0:

@@ -525,9 +525,11 @@ def test_an_interrupted_backfill_re_run_writes_no_duplicate_records(
 ) -> None:
     """The first run is cut off by its budget; the second covers the same range.
 
-    This is the whole of resumability. There is no cursor and no run id: the second
-    run re-reads the review, derives the same semantic event id from the forge's own
-    identity, collides on the claim, and writes nothing.
+    This is the whole of resumability. The first run finished the first change,
+    so it left a receipt and the second run skips its reads outright; the
+    second change has no receipt, so it is read and stored. Identity still
+    guards the records -- nothing is written twice -- but the skip is what
+    keeps the second run from paying for the first run's reads again.
     """
     sink = RecordingSink()
     history = FakeHistory(
@@ -554,7 +556,8 @@ def test_an_interrupted_backfill_re_run_writes_no_duplicate_records(
 
     assert second.budget_exhausted is False
     assert second.records_written == 2, "only the change the first run never reached"
-    assert second.already_present == 1, "the review the first run already captured"
+    assert second.skipped_finished == 1, "the finished change is skipped, not re-read"
+    assert second.already_present == 0, "nothing re-read means nothing to collide on"
     entry_ids = [entry.entry_id for entry in sink.entries]
     assert len(entry_ids) == 4
     assert len(set(entry_ids)) == 4, "identity, not a cursor, is what stopped the duplicates"
@@ -570,7 +573,11 @@ def test_a_re_read_comment_collides_on_the_semantic_event_id(
     history = _history_with_one_review()
 
     _run(history, registry, first_sink)
-    report = _run(history, registry, second_sink)
+    # A wider window than the receipt was written under, so the receipt does
+    # not apply and the review is genuinely re-read: this is the path that
+    # proves the collision is on the forge-derived id rather than on a skip.
+    wider = _plan(since=datetime(2023, 1, 1, tzinfo=UTC))
+    report = _run(history, registry, second_sink, wider)
 
     assert second_sink.entries == [], "a second record for the same comment is the failure"
     assert report.records_written == 0
@@ -935,7 +942,8 @@ def test_a_second_run_walks_past_what_the_first_stored(
 
     assert second.objects_new == 42, "the 40 unread changes of page one, plus the 2 of page two"
     assert second.budget_exhausted is False, "the range was walked to its end"
-    assert second.already_present == 60, "and nothing was paid for the 60 the first run stored"
+    assert second.skipped_finished == 60, "the 60 the first run finished are skipped, not re-read"
+    assert second.already_present == 0, "nothing re-read means nothing to collide on"
     reached = {entry.metadata["pr_number"] for entry in sink.entries} - first_numbers
     assert page + 1 in reached, (
         "the second run has to reach a change the first one never read, which is the "
@@ -989,7 +997,8 @@ def test_a_re_run_over_a_fully_stored_range_is_not_reported_as_a_truncation(
     second = _run(history, registry, sink)
 
     assert second.records_written == 0
-    assert second.already_present == 1
+    assert second.skipped_finished == 1, "the finished pull request is skipped, not re-read"
+    assert second.already_present == 0
     assert second.budget_exhausted is False
     assert second.unreadable == 0
 

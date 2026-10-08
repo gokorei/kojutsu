@@ -113,7 +113,7 @@ def _now() -> str:
     return datetime.now(UTC).isoformat()
 
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 DELIVERY_LEASE = timedelta(minutes=5)
 ANSWER_LEASE = timedelta(minutes=5)
 PR_EVENT_LEASE = timedelta(minutes=5)
@@ -511,6 +511,28 @@ _MIGRATION_V6: tuple[str, ...] = (
 #: existing ``ALTER TABLE ... ADD COLUMN`` handling makes a re-run a no-op.
 _MIGRATION_V7: tuple[str, ...] = ("ALTER TABLE questions ADD COLUMN head_sha TEXT",)
 
+#: Pass-end receipts for history backfills: which pull requests a run finished
+#: reading, under what window, and what listing timestamp it saw. The next run
+#: skips the expensive review/comment reads for a finished, unchanged PR. This
+#: is evidence keyed on the PR, not a positional cursor: listing order still
+#: decides what runs, so there is nothing to drift or lose.
+_MIGRATION_V8: tuple[str, ...] = (
+    """
+    CREATE TABLE IF NOT EXISTS backfill_receipts (
+        repo TEXT NOT NULL,
+        pr_number INTEGER NOT NULL,
+        observed_updated_at TEXT NOT NULL,
+        window_since TEXT NOT NULL,
+        window_until TEXT,
+        associations TEXT,
+        finished INTEGER NOT NULL DEFAULT 0,
+        recorded_at TEXT NOT NULL,
+        PRIMARY KEY (repo, pr_number)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS backfill_receipts_repo_idx ON backfill_receipts (repo)",
+)
+
 #: Migrations recorded in the ``registry_migrations`` ledger, and therefore
 #: checksum-verified on every open. Extend this as versions are added.
 _LEDGERED_MIGRATIONS: dict[int, tuple[str, ...]] = {
@@ -518,6 +540,7 @@ _LEDGERED_MIGRATIONS: dict[int, tuple[str, ...]] = {
     5: _MIGRATION_V5,
     6: _MIGRATION_V6,
     7: _MIGRATION_V7,
+    8: _MIGRATION_V8,
 }
 
 
@@ -741,6 +764,16 @@ def _validate_schema(db: sqlite3.Connection) -> None:
             "completed_at",
             "claim_token",
         },
+        "backfill_receipts": {
+            "repo",
+            "pr_number",
+            "observed_updated_at",
+            "window_since",
+            "window_until",
+            "associations",
+            "finished",
+            "recorded_at",
+        },
     }
     for table, required in required_columns.items():
         if not _table_exists(db, table) or not required.issubset(_table_columns(db, table)):
@@ -896,6 +929,7 @@ def _migrate_schema_transaction(db: sqlite3.Connection) -> None:
     _record_migration(db, 5, _MIGRATION_V5)
     _record_migration(db, 6, _MIGRATION_V6)
     _record_migration(db, 7, _MIGRATION_V7)
+    _record_migration(db, 8, _MIGRATION_V8)
     db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     _validate_schema(db)
 

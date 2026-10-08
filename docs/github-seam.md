@@ -215,8 +215,12 @@ Two things follow, and both are in the command's output rather than only here:
   `--max-objects` was charged against. They are different numbers, and one run can
   read a great deal and store two records.
 - The forge reads are bounded by the page ceilings, not by `--max-objects`. A re-run
-  over a range already walked re-reads it. That is the trade, and `--until` is what
-  makes it a choice.
+  over a range already walked re-lists it -- the listing is ~20 requests for a
+  quarter -- but a pull request a finished pass already covered under the same
+  window costs no review or comment reads: the pass recorded its end (number,
+  listing timestamp, window) and an unchanged listing timestamp proves nothing
+  moved since. `already-finished` counts those skips. `--until` still makes the
+  range a choice.
 
 **A run that stops at its budget is truncated, and says so.** The summary prints
 `TRUNCATED`, on stderr, and the command exits **2** as `backfill` does — a
@@ -319,9 +323,16 @@ constants are not two answers to one question, and removing the pace because con
 exists would put back the 403 that `SEARCH_REQUESTS_PER_MINUTE` documents, one page into
 the walk.
 
-There is still no cursor, for the reason `core/backfill_reviews.py` records: the
-semantic event ids derive identity from the forge's own object identity, so
-"have I seen this?" is answerable from the store. The store is the cursor.
+There is still no positional cursor, for the reason `core/backfill_reviews.py`
+records: the semantic event ids derive identity from the forge's own object
+identity, so "have I seen this?" is answerable from the store. The store is the
+cursor. What a finished pass additionally records is its own ends -- per pull
+request, the listing timestamp it saw and the window it ran under -- because the
+store alone cannot prove a pass finished: an empty-bodied review is read and kept
+as nothing, and a stopped run can leave a hole between two stored comments. A
+receipt is keyed evidence, not a position, so listing order still decides what
+runs and there is nothing to drift or lose. A pull request a stopped run was
+inside has no finished receipt, which is what makes it re-readable.
 
 ## Minimum token scope
 

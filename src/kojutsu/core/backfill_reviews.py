@@ -489,6 +489,12 @@ class BackfillReport:
     silent: int = 0
     objects_new: int = 0
     budget_exhausted: bool = False
+    #: Pull requests whose review/comment reads were skipped because a finished
+    #: pass already covers them under this window (see
+    #: :func:`_finished_and_unchanged`). Not read, not charged, not missing --
+    #: the listing that proved them unchanged is the cheap part of the run, and
+    #: this is the expensive part it avoided.
+    skipped_finished: int = 0
     #: Objects read that stored nothing, grouped by the gate that refused them.
     #:
     #: This is the counter ``silent`` was, split by cause. The two have opposite
@@ -555,6 +561,7 @@ class _Tally:
         self.already_present = 0
         self.silent = 0
         self.objects_new = 0
+        self.skipped_finished = 0
         self.floor_unreached = False
         self.refusals: dict[str, int] = {}
         self.gaps: list[BackfillGap] = []
@@ -606,6 +613,60 @@ def _within_window(timestamp: datetime | None, plan: BackfillPlan) -> bool:
     if timestamp is None:
         return False
     return not (_before_floor(timestamp, plan) or _above_ceiling(timestamp, plan))
+
+
+def _finished_and_unchanged(
+    registry: QuestionRegistry,
+    *,
+    repository: str,
+    pr_number: int,
+    updated_at: datetime | None,
+    plan: BackfillPlan,
+) -> bool:
+    """Whether a finished pass already covers this pull request under this window.
+
+    True only for a receipt this code wrote: the pass finished the pull request,
+    ran under the same window (floor, ceiling, admitted associations), and saw a
+    listing timestamp at least as new as this listing's. The review and comment
+    reads are then skipped entirely -- nothing on the pull request can have
+    produced a storable object this run has not already seen, because any new
+    review, comment, or push moves the listing timestamp and fails the recency
+    check.
+
+    Everything else reads: no receipt (including the pull request a stopped run
+    was inside, which by construction has none), an unfinished pass, a window
+    the receipt was not written under, a pull request with no listing timestamp
+    to place, or a receipt value that does not parse. A receipt that cannot be
+    understood must never skip work -- failing open spends reads, failing closed
+    drops history.
+    """
+    if pr_number <= 0 or updated_at is None:
+        return False
+    try:
+        receipt = registry.get_backfill_receipt(repo=repository, pr_number=pr_number)
+    except Exception:
+        return False
+    if not receipt or not receipt.get("finished"):
+        return False
+    if receipt.get("window_since") != plan.since.isoformat():
+        return False
+    expected_until = plan.until.isoformat() if plan.until is not None else None
+    if receipt.get("window_until") != expected_until:
+        return False
+    if receipt.get("associations") != _associations_key(plan.authorized_associations):
+        return False
+    try:
+        observed = datetime.fromisoformat(str(receipt["observed_updated_at"]))
+    except (TypeError, ValueError):
+        return False
+    return _normalise(observed) >= _normalise(updated_at)
+
+
+def _associations_key(authorized_associations: frozenset[str] | None) -> str | None:
+    """The receipt form of the admission policy: sorted CSV, or ``None`` for all."""
+    if authorized_associations is None:
+        return None
+    return ",".join(sorted(authorized_associations))
 
 
 def _pages(
@@ -767,6 +828,7 @@ def _single_pull_requests(
     plan: BackfillPlan,
     tally: _Tally,
     repository: str,
+    registry: QuestionRegistry,
 ) -> Iterator[Any]:
     """Yield the bound pull requests, reading no listing pages at all.
 
@@ -808,6 +870,19 @@ def _single_pull_requests(
             _before_floor(updated_at, plan) or _above_ceiling(updated_at, plan)
         ):
             continue
+        if _finished_and_unchanged(
+            registry,
+            repository=repository,
+            pr_number=pr_number,
+            updated_at=updated_at,
+            plan=plan,
+        ):
+            # A finished pass under this window already saw everything this
+            # pull request can store, and the listing timestamp proves nothing
+            # moved since. The listing read that proved it is the cheap part;
+            # the review and comment reads it avoids are not.
+            tally.skipped_finished += 1
+            continue
         tally.objects_read += 1
         yield pull
 
@@ -819,6 +894,7 @@ def _pull_requests(
     plan: BackfillPlan,
     tally: _Tally,
     repository: str,
+    registry: QuestionRegistry,
     *,
     reads: _PageReads,
 ) -> Iterator[Any]:
@@ -874,7 +950,7 @@ def _pull_requests(
     own floor is the same defect as a range silently cut short by the budget.
     """
     if plan.pr_numbers is not None:
-        yield from _single_pull_requests(reader, plan, tally, repository)
+        yield from _single_pull_requests(reader, plan, tally, repository, registry)
         return
     next_page = 1
     while next_page <= MAX_PAGES_PER_OBJECT:
@@ -910,6 +986,16 @@ def _pull_requests(
                         # update time cannot be placed against a bound at all and is
                         # walked rather than guessed at.
                         continue
+                pr_number = int(getattr(pull, "number", 0) or 0)
+                if _finished_and_unchanged(
+                    registry,
+                    repository=repository,
+                    pr_number=pr_number,
+                    updated_at=updated_at,
+                    plan=plan,
+                ):
+                    tally.skipped_finished += 1
+                    continue
                 tally.objects_read += 1
                 yield pull
             if len(batch) < PAGE_SIZE:
@@ -982,7 +1068,9 @@ def run_backfill(
     try:
         for repository in plan.repositories:
             owner, name = split_repo(repository)
-            for pull in _pull_requests(reader, owner, name, plan, tally, repository, reads=reads):
+            for pull in _pull_requests(
+                reader, owner, name, plan, tally, repository, registry, reads=reads
+            ):
                 _reconstruct_pull_request(
                     reader=reader,
                     registry=registry,
@@ -1018,6 +1106,7 @@ def run_backfill(
         silent=tally.silent,
         objects_new=tally.objects_new,
         budget_exhausted=budget_exhausted,
+        skipped_finished=tally.skipped_finished,
         floor_unreached=tally.floor_unreached,
         refusals=dict(sorted(tally.refusals.items(), key=lambda item: -item[1])),
         gaps=tuple(tally.gaps),
@@ -1047,9 +1136,28 @@ def _reconstruct_pull_request(
         )
         return
 
+    # Whether every page this pull request needed was actually walked. A pass
+    # that stops at the page ceiling read a prefix, not the pull request, and
+    # recording it as finished would let the next run skip the unread tail --
+    # so the flag starts true and any truncation clears it. An exception (a
+    # missing object, an unreadable review, the budget running out) leaves
+    # through the frame before the receipt below is written, which is what
+    # makes the pull request a run stops inside re-readable: it has no
+    # finished receipt, so the next run reads it and stores only what is
+    # missing.
+    finished = True
+
+    def _mark_unfinished() -> None:
+        nonlocal finished
+        finished = False
+
+    def _gap_unfinished(what: str) -> None:
+        tally.gap(repository, pr_number, what, _PAGE_CEILING_REASON)
+        _mark_unfinished()
+
     for review in _pages(
         lambda page: reader.list_reviews(owner, name, pr_number, page=page, per_page=PAGE_SIZE),
-        truncated=lambda: tally.gap(repository, pr_number, "reviews", _PAGE_CEILING_REASON),
+        truncated=lambda: _gap_unfinished("reviews"),
     ):
         submitted_at = getattr(review, "submitted_at", None)
         if not _within_window(submitted_at, plan):
@@ -1071,6 +1179,7 @@ def _reconstruct_pull_request(
             review=review,
             budget=budget,
             tally=tally,
+            on_truncated=_mark_unfinished,
         )
 
     _reconstruct_issue_comments(
@@ -1084,7 +1193,27 @@ def _reconstruct_pull_request(
         pr_number=pr_number,
         budget=budget,
         tally=tally,
+        on_truncated=_mark_unfinished,
     )
+
+    # The pass end, in the pass's own terms: this pull request was walked to
+    # its last page under this window, so a later run under the same window
+    # whose listing timestamp is no newer can skip it. Stored comment
+    # timestamps are deliberately not the evidence -- an empty-bodied review is
+    # read and kept as nothing, and a pass can stop after one comment and
+    # before another, so the oldest and newest stored comments do not prove
+    # the middle was read. Only reaching this line proves it.
+    observed_at = getattr(pull, "updated_at", None)
+    if observed_at is not None:
+        registry.record_backfill_receipt(
+            repo=repository,
+            pr_number=pr_number,
+            observed_updated_at=_normalise(observed_at),
+            window_since=plan.since,
+            window_until=plan.until,
+            authorized_associations=plan.authorized_associations,
+            finished=finished,
+        )
 
 
 def _reconstruct_review(
@@ -1101,11 +1230,17 @@ def _reconstruct_review(
     review: Any,
     budget: _Budget,
     tally: _Tally,
+    on_truncated: Callable[[], None] | None = None,
 ) -> None:
     review_id = int(getattr(review, "id", 0) or 0)
     user = getattr(review, "user", None)
     login = getattr(user, "login", None)
     what = f"review {review_id}"
+
+    def _comments_truncated() -> None:
+        tally.gap(repository, pr_number, what, _PAGE_CEILING_REASON)
+        if on_truncated is not None:
+            on_truncated()
 
     # The inline comments are read before the review is handed to a collector,
     # which is the whole of requirement "a deleted object produces nothing". A
@@ -1120,7 +1255,7 @@ def _reconstruct_review(
             name,
             pr_number,
             review_id,
-            truncated=lambda: tally.gap(repository, pr_number, what, _PAGE_CEILING_REASON),
+            truncated=_comments_truncated,
         )
     except Exception as exc:
         if is_missing_object(exc):
@@ -1231,6 +1366,7 @@ def _reconstruct_issue_comments(
     pr_number: int,
     budget: _Budget,
     tally: _Tally,
+    on_truncated: Callable[[], None] | None = None,
 ) -> None:
     """Handle a pull request's conversation, and refuse to invent an answer.
 
@@ -1246,14 +1382,18 @@ def _reconstruct_issue_comments(
     *and* a registered parent question, so a comment that carries neither cannot
     reach the store no matter which writer calls it.
     """
+
+    def _conversation_truncated() -> None:
+        tally.gap(repository, pr_number, "issue comments", _PAGE_CEILING_REASON)
+        if on_truncated is not None:
+            on_truncated()
+
     comments = list(
         _pages(
             lambda page: reader.list_issue_comments(
                 owner, name, pr_number, page=page, per_page=PAGE_SIZE
             ),
-            truncated=lambda: tally.gap(
-                repository, pr_number, "issue comments", _PAGE_CEILING_REASON
-            ),
+            truncated=_conversation_truncated,
         )
     )
     # The parent question is resolved from the same read, exactly as the live path

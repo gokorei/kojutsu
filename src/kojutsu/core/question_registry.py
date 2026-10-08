@@ -248,6 +248,20 @@ class QuestionRegistry(Protocol):
 
     def release_pr_state_change(self, event_id: str, claim_token: str, error: str) -> bool: ...
 
+    def get_backfill_receipt(self, *, repo: str, pr_number: int) -> dict[str, Any] | None: ...
+
+    def record_backfill_receipt(
+        self,
+        *,
+        repo: str,
+        pr_number: int,
+        observed_updated_at: datetime,
+        window_since: datetime,
+        window_until: datetime | None,
+        authorized_associations: frozenset[str] | None,
+        finished: bool,
+    ) -> None: ...
+
     def record_session(self, session: ReviewSession) -> None: ...
 
     def claim_delivery(
@@ -1464,6 +1478,80 @@ class SqliteQuestionRegistry:
                 raise
             else:
                 return cursor.rowcount == 1
+
+    @staticmethod
+    def _backfill_repo_key(repo: str) -> str:
+        """Receipts key on identity, not spelling: two casings of one repository
+        cannot hold two receipts that disagree about whether it was finished."""
+        return repo.casefold()
+
+    @staticmethod
+    def _backfill_associations_key(
+        authorized_associations: frozenset[str] | None,
+    ) -> str | None:
+        if authorized_associations is None:
+            return None
+        return ",".join(sorted(authorized_associations))
+
+    def get_backfill_receipt(self, *, repo: str, pr_number: int) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._db.execute(
+                """
+                SELECT observed_updated_at, window_since, window_until, associations,
+                       finished, recorded_at
+                FROM backfill_receipts WHERE repo = ? AND pr_number = ?
+                """,
+                (self._backfill_repo_key(repo), int(pr_number)),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "observed_updated_at": row[0],
+            "window_since": row[1],
+            "window_until": row[2],
+            "associations": row[3],
+            "finished": bool(row[4]),
+            "recorded_at": row[5],
+        }
+
+    def record_backfill_receipt(
+        self,
+        *,
+        repo: str,
+        pr_number: int,
+        observed_updated_at: datetime,
+        window_since: datetime,
+        window_until: datetime | None,
+        authorized_associations: frozenset[str] | None,
+        finished: bool,
+    ) -> None:
+        with self._lock:
+            self._db.execute(
+                """
+                INSERT INTO backfill_receipts
+                    (repo, pr_number, observed_updated_at, window_since, window_until,
+                     associations, finished, recorded_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (repo, pr_number) DO UPDATE SET
+                    observed_updated_at = excluded.observed_updated_at,
+                    window_since = excluded.window_since,
+                    window_until = excluded.window_until,
+                    associations = excluded.associations,
+                    finished = excluded.finished,
+                    recorded_at = excluded.recorded_at
+                """,
+                (
+                    self._backfill_repo_key(repo),
+                    int(pr_number),
+                    observed_updated_at.isoformat(),
+                    window_since.isoformat(),
+                    window_until.isoformat() if window_until is not None else None,
+                    self._backfill_associations_key(authorized_associations),
+                    1 if finished else 0,
+                    datetime.now(UTC).isoformat(),
+                ),
+            )
+            self._db.commit()
 
     def claim_delivery(
         self, delivery_id: str, repo: str, event: str, payload_hash: str

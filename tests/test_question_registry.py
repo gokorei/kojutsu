@@ -1119,7 +1119,10 @@ def _v6_column_names() -> tuple[str, ...]:
     try:
         connection.executescript(_v3_questions_table())
         for version, statements in sorted(question_registry_module._LEDGERED_MIGRATIONS.items()):
-            if version >= SCHEMA_VERSION:
+            # Pinned at 7, not at SCHEMA_VERSION: v6 is the schema *before* the
+            # anchor migration, frozen. Bumping the current version must not
+            # silently redefine what this fixture builds.
+            if version >= 7:
                 continue
             for statement in statements:
                 question_registry_module._apply_statement(connection, statement)
@@ -1156,7 +1159,8 @@ def _write_v6_registry(path: Path, *, questions: tuple) -> None:
     applied = [
         (version, statements)
         for version, statements in sorted(question_registry_module._LEDGERED_MIGRATIONS.items())
-        if version < SCHEMA_VERSION
+        # Pinned at 7: a v6 file is every step before the anchor migration.
+        if version < 7
     ]
     for _version, statements in applied:
         for statement in statements:
