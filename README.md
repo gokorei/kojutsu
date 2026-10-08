@@ -569,7 +569,7 @@ uv run kojutsu-mcp
 
 ## License
 
-Kojutsu is licensed under the GNU Affero General Public License v3.0 only. See [`LICENSE`](LICENSE) for details. Contributions are welcome; see [`CONTRIBUTING.md`](CONTRIBUTING.md) and [`SECURITY.md`](SECURITY.md).
+Kojutsu is licensed under the GNU Affero General Public License v3.0 only. See [`LICENSE`](LICENSE) for details. Code contributions are not being accepted yet; see [`CONTRIBUTING.md`](CONTRIBUTING.md). Security reports are welcome any time; see [`SECURITY.md`](SECURITY.md).
 
 Note that the AGPL is a network-copyleft license: if you run a modified
 version as a network service (including the webhook server), you must offer

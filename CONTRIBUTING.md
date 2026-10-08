@@ -1,6 +1,11 @@
 # Contributing to Kojutsu
 
-Thanks for helping improve Kojutsu.
+> **Not accepting contributions yet.** Code contributions (pull requests) are
+> paused until there is enough interest in the project. Pull requests from
+> outside the admin team are closed automatically. If Kojutsu is useful to
+> you, the most helpful signal is opening an issue describing your use case.
+>
+> What follows is the workflow that will apply once contributions open.
 
 ## Development setup
 
