@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+.package-venv/
+
+# Test / lint / type caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+coverage.xml
+htmlcov/
+.playwright-mcp/
+
+# Environment / secrets
+.env
+
+# Pijul metadata
+.pijul/
+
+# OS / editors
+.DS_Store
+.idea/
+.vscode/

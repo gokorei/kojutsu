@@ -1,0 +1,17 @@
+.git
+.DS_Store
+.env
+.venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+__pycache__/
+*.py[cod]
+.playwright-mcp/
+.coverage
+coverage.xml
+htmlcov/
+dist/
+build/
+*.egg-info/
+.pijul/

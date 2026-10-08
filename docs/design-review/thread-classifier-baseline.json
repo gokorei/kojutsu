@@ -1,0 +1,343 @@
+{
+  "aggregates": {
+    "contradictions": 2,
+    "flipping_comments": 8,
+    "invented_pairs_mean": 0.6667,
+    "model_calls": 2,
+    "precision_model_only_mean": 0.875,
+    "recall_all_pairs_mean": 0.4242,
+    "recall_model_only_mean": 0.4242,
+    "recovered_by_model_mean": 4.6667,
+    "recovered_max": 7,
+    "recovered_mean": 4.6667,
+    "recovered_min": 0,
+    "runs_refused": 1,
+    "runs_that_produced_no_pairs": 1
+  },
+  "archive": "thread-archive/pr-1.json",
+  "archive_digest": "db6e0fb70cb4dc68",
+  "collection": "kojutsu-real",
+  "comments": 25,
+  "contradictions": [
+    {
+      "answer_comment_id": 5860841941,
+      "conflicts_with": "the store holds 5860836084 answered by 5860877070 (acme/widgets/pr-1/answer-ccb434dd7b6789f04fb78f81c836018d877f4406068ed6230ca683d3e09e0f4e)",
+      "kind": "question_of_known_pair_paired_to_a_new_answer",
+      "question_comment_id": 5860836084,
+      "run": 1
+    },
+    {
+      "answer_comment_id": 5860841941,
+      "conflicts_with": "the store holds 5860836084 answered by 5860877070 (acme/widgets/pr-1/answer-ccb434dd7b6789f04fb78f81c836018d877f4406068ed6230ca683d3e09e0f4e)",
+      "kind": "question_of_known_pair_paired_to_a_new_answer",
+      "question_comment_id": 5860836084,
+      "run": 3
+    }
+  ],
+  "flips": [
+    {
+      "comment_id": 5860835972,
+      "placements": {
+        "1": "clarification:-",
+        "3": "unrelated:-"
+      }
+    },
+    {
+      "comment_id": 5860836186,
+      "placements": {
+        "1": "clarification:-",
+        "3": "unrelated:-"
+      }
+    },
+    {
+      "comment_id": 5861224811,
+      "placements": {
+        "1": "clarification:-",
+        "3": "unrelated:-"
+      }
+    },
+    {
+      "comment_id": 5861225138,
+      "placements": {
+        "1": "clarification:-",
+        "3": "unrelated:-"
+      }
+    },
+    {
+      "comment_id": 5886792079,
+      "placements": {
+        "1": "clarification:-",
+        "3": "unrelated:-"
+      }
+    },
+    {
+      "comment_id": 5886792333,
+      "placements": {
+        "1": "clarification:-",
+        "3": "unrelated:-"
+      }
+    },
+    {
+      "comment_id": 5886792798,
+      "placements": {
+        "1": "clarification:-",
+        "3": "unrelated:-"
+      }
+    },
+    {
+      "comment_id": 5894503097,
+      "placements": {
+        "1": "clarification:-",
+        "3": "unrelated:-"
+      }
+    }
+  ],
+  "format": "kojutsu.thread-classifier-eval/1",
+  "ground_truth_digest": "2074cc778498799f",
+  "ground_truth_pairs": [
+    [
+      5860835793,
+      5860881523
+    ],
+    [
+      5860835876,
+      5860881656
+    ],
+    [
+      5860836084,
+      5860877070
+    ],
+    [
+      5861224934,
+      5861228970
+    ],
+    [
+      5861225037,
+      5861229111
+    ],
+    [
+      5861225237,
+      5861229274
+    ],
+    [
+      5886792079,
+      5894503097
+    ],
+    [
+      5886792333,
+      5894503310
+    ],
+    [
+      5886792547,
+      5891489025
+    ],
+    [
+      5886792798,
+      5894503555
+    ],
+    [
+      5886793012,
+      5891488763
+    ]
+  ],
+  "model": "opencode/model",
+  "omitted_comment_ids": [
+    5894503310,
+    5894503555
+  ],
+  "outcome_distribution": {
+    "anchored_pairs": {
+      "max": 0,
+      "min": 0,
+      "per_run": [
+        0,
+        0,
+        0
+      ]
+    },
+    "anchored_questions": {
+      "max": 0,
+      "min": 0,
+      "per_run": [
+        0,
+        0,
+        0
+      ]
+    },
+    "clarifications": {
+      "max": 9,
+      "min": 0,
+      "per_run": [
+        9,
+        0,
+        1
+      ]
+    },
+    "conflicts": {
+      "max": 3,
+      "min": 0,
+      "per_run": [
+        0,
+        0,
+        3
+      ]
+    },
+    "declined_pairs": {
+      "max": 0,
+      "min": 0,
+      "per_run": [
+        0,
+        0,
+        0
+      ]
+    },
+    "inferred_pairs": {
+      "max": 8,
+      "min": 0,
+      "per_run": [
+        8,
+        0,
+        8
+      ]
+    },
+    "unattributable_lines": {
+      "max": 0,
+      "min": 0,
+      "per_run": [
+        0,
+        0,
+        0
+      ]
+    },
+    "unrelated": {
+      "max": 8,
+      "min": 0,
+      "per_run": [
+        0,
+        0,
+        8
+      ]
+    }
+  },
+  "pairwise_stability": [
+    {
+      "agreements": 17,
+      "comments": 25,
+      "runs": [
+        1,
+        3
+      ],
+      "stability": 0.68
+    }
+  ],
+  "pr": 1,
+  "publication_note": "Published with two fields redacted for distribution: `model` and `archive`. Both are identifiers of the operator's environment, not of the measurement, and neither affects any figure here. `repo` and the comment ids are placeholders: the repository this was measured against has since been deleted, so this measurement cannot be re-taken against any real thread. What survives is the shape of the result -- the distribution across pairs, clarifications and unrelated, the variance across runs, and which comments flipped -- not a claim anybody can independently reproduce. A re-run reports `model` as the harness default, which is why the baseline carries the same placeholder -- otherwise `compare` would refuse its own baseline as a change of inputs.",
+  "recall_ceiling": 9,
+  "recorded_at": "2026-09-30T16:04:51.807565+00:00",
+  "repo": "acme/widgets",
+  "runs": [
+    {
+      "clarifications": 9,
+      "coverage": {
+        "accounted": 25,
+        "anchored_pairs": 0,
+        "anchored_questions": 0,
+        "clarifications": 9,
+        "comments": 25,
+        "complete": true,
+        "conflicts": 0,
+        "declined_pairs": 0,
+        "inferred_pairs": 8,
+        "model_calls": 1,
+        "unattributable_lines": 0,
+        "unrelated": 0
+      },
+      "declined": 0,
+      "missed": 4,
+      "pairs_held": 8,
+      "precision_model_only": 0.875,
+      "recall_all_pairs": 0.6364,
+      "recall_model_only": 0.6364,
+      "recovered": 7,
+      "recovered_by_model": 7,
+      "refused": null,
+      "run": 1,
+      "unmatched_anchored": 0,
+      "unmatched_inferred": 1,
+      "unrelated": 0
+    },
+    {
+      "clarifications": 0,
+      "coverage": {
+        "accounted": 0,
+        "anchored_pairs": 0,
+        "anchored_questions": 0,
+        "clarifications": 0,
+        "comments": 0,
+        "complete": false,
+        "conflicts": 0,
+        "declined_pairs": 0,
+        "inferred_pairs": 0,
+        "model_calls": 0,
+        "unattributable_lines": 0,
+        "unrelated": 0
+      },
+      "declined": 0,
+      "missed": 11,
+      "pairs_held": 0,
+      "precision_model_only": null,
+      "recall_all_pairs": 0.0,
+      "recall_model_only": 0.0,
+      "recovered": 0,
+      "recovered_by_model": 0,
+      "refused": "the model did not account for comment id(s) 5861225138; a partial classification is refused rather than stored, because a comment that went unread is indistinguishable from one nobody posted",
+      "run": 2,
+      "unmatched_anchored": 0,
+      "unmatched_inferred": 0,
+      "unrelated": 0
+    },
+    {
+      "clarifications": 1,
+      "coverage": {
+        "accounted": 25,
+        "anchored_pairs": 0,
+        "anchored_questions": 0,
+        "clarifications": 1,
+        "comments": 25,
+        "complete": true,
+        "conflicts": 3,
+        "declined_pairs": 0,
+        "inferred_pairs": 8,
+        "model_calls": 1,
+        "unattributable_lines": 0,
+        "unrelated": 8
+      },
+      "declined": 1,
+      "missed": 4,
+      "pairs_held": 8,
+      "precision_model_only": 0.875,
+      "recall_all_pairs": 0.6364,
+      "recall_model_only": 0.6364,
+      "recovered": 7,
+      "recovered_by_model": 7,
+      "refused": null,
+      "run": 3,
+      "unmatched_anchored": 0,
+      "unmatched_inferred": 1,
+      "unrelated": 8
+    }
+  ],
+  "scope": "THIS IS NOT A MEASUREMENT OF THE WHOLE THREAD. The classifier's own prompt bound clipped 2 comment(s) out of the thread before the model saw them (5894503310, 5894503555), so the highest recall this measurement could have reported is 9 of 11 and every figure below is on a smaller input than the thread. The classifier as built cannot classify this thread at all; the numbers describe what it does with the part it accepts.\n\nMeasured on one thread: 11 pairings a person established were read back out of the store as the truth, covering 22 of the thread's comments. One repository, one reviewer, one model, one configuration, 3 sample(s) in the 'marker-blind' configuration. This is a data point, not a property of the classifier.\n\nWhat it cannot show: the truth set is the pairings somebody marked, so it contains no record of a comment that correctly has no pairing. A pairing outside the set is therefore a pairing that must be read by a person, and this report lists each one by comment id rather than counting it as an error.\n\nWhat it cannot show: one thread is one author writing to himself, with no disagreement between parties. A classifier measured on it has been asked to resolve ambiguity that is unusually low, and nothing here says what it does on a thread where two people disagree.\n\nWhat it cannot show: one model, a handful of times. Confidence numbers move between runs even where the structural decision does not, so a single sample's figures are not a distribution. The per-run spread in this report is the honest width of the measurement, and it is narrow because the sample is small.\n\nWhat it is not: a review of the pull request it ran against. Nothing in this record is evidence about that repository's code, and a good number here says nothing about whether the review was right.",
+  "thread_comments": 27,
+  "thread_mode": "marker-blind",
+  "unrelated_comment_ids": [
+    5860835972,
+    5860836186,
+    5861224811,
+    5861225138,
+    5886792079,
+    5886792333,
+    5886792798,
+    5894503097
+  ]
+}

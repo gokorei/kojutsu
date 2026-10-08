@@ -1,0 +1,158 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "kojutsu"
+version = "0.1.0"
+description = "Capture developer knowledge during code review via PR and Jira context"
+readme = "README.md"
+license = { text = "AGPL-3.0-only" }
+requires-python = ">=3.11"
+# Dependency policy: runtime floors float on purpose, deploys pin via uv.lock.
+#
+# Each entry below keeps only a lower bound (except ``mcp``, whose ``<3`` guards
+# the v2 protocol this server speaks) so library consumers resolve against the
+# newest compatible release instead of the newest release available when this
+# file was last edited. An upper bound here would refuse a compatible fix
+# release until somebody bumps the ceiling -- which is a release chore, not a
+# compatibility fact. The reproducible artifact is ``uv.lock`` (checked with
+# ``uv lock --locked`` in CI); floats resolve at install time, pins ship at
+# deploy time. Dev tools pin exactly because a linter or typechecker upgrade is
+# a behavior change to the gate, not to the product.
+dependencies = [
+    "typer>=0.12.0",
+    "httpx>=0.28.1",
+    "fastapi>=0.135.1",
+    "uvicorn[standard]>=0.41.0",
+    "litellm>=1.81.13",
+    "pydantic>=2.12.5",
+    "pydantic-settings>=2.13.1",
+    "mcp>=2,<3",
+    "pyyaml>=6.0.3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "mypy==1.18.2",
+    "pip-audit==2.9.0",
+    "pytest>=8.3.0",
+    "pytest-cov>=6.0.0",
+    "pytest-asyncio>=0.24.0",
+    "ruff==0.14.13",
+    "types-PyYAML>=6.0.12",
+]
+
+[project.scripts]
+kojutsu = "kojutsu.cli:app"
+kojutsu-mcp = "mcp_server.server:main"
+kojutsu-capture = "mcp_server.capture_server:main"
+kojutsu-compare = "kojutsu.compare:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/kojutsu", "mcp_server"]
+
+[tool.hatch.build.targets.sdist]
+exclude = [
+    "/.pijul",
+    "/.pijul/**",
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+src = ["src", "tests", "mcp_server", "scripts"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP", "B", "C4", "SIM", "TRY", "PTH", "ASYNC", "RUF", "S", "PLE2502", "PLR1711", "PLC0208", "PLW2901", "PLR0124"]
+# PLR0913/0911/0912/0915 (complexity caps) and PLW0603 (globals) stay off: long
+# signatures with per-parameter docs and branchy collectors are the house style,
+# and module-level operational state (outbox owners, relay tasks, plan locks)
+# is documented where it lives rather than threaded through every call.
+# TRY003 is off on purpose: raises in this codebase carry long operator-facing
+# messages (what to do next, not just what failed), and assigning every one to
+# a variable first adds indirection without value. EM101/EM102 are off for the
+# same reason -- f-string exception messages with embedded context are the
+# house style, and there is no message-catalog story that would benefit.
+# Both are revisited if that ever changes, not silently.
+ignore = ["E501", "TRY003", "TRY004", "TRY301", "S608"]
+# S608 flags every f-string SQL statement, but this codebase never interpolates
+# untrusted input into SQL text: values always travel as ``?`` parameters, and
+# f-strings carry only static schema identifiers (column lists) and ``?``
+# placeholder runs built from counts. Triaged all 27 sites 2026-10-07; none
+# interpolates caller-controlled text.
+# TRY004 wants TypeError for failed isinstance checks, but every one of those
+# sites validates operator or configuration input (CLI flags, env vars, API
+# arguments), and the callers catch ValueError to refuse cleanly with an exit
+# code. Raising TypeError there would turn a clean refusal into a traceback.
+# TRY301 wants raises moved out of try blocks, but the raise-inside-try here is
+# the uniform guard/rollback/propagate idiom: _migrate_schema's version-mismatch
+# raise must stay inside so `except BaseException: rollback` releases the write
+# lock, and the claim writers' raises must stay inside so the failure path
+# releases the lease. Abstracting each into an inner function would scatter
+# thirty single-use helpers to satisfy the rule while hiding the protocol.
+# S101 (assert) in tests is the assertion mechanism, not a contract hole.
+# Production asserts were removed individually (cast or explicit raise).
+# S104/S105/S106/S107 in tests are fixtures by construction: fake tokens and
+# loopback-or-any binds carrying no real credentials and serving no real traffic.
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "S104", "S105", "S106", "S107"]
+
+[tool.ruff.lint.flake8-bugbear]
+extend-immutable-calls = ["typer.Option", "typer.Argument"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.mypy]
+python_version = "3.11"
+check_untyped_defs = true
+ignore_missing_imports = true
+disable_error_code = ["import-untyped"]
+explicit_package_bases = true
+files = [
+    "src/kojutsu",
+    "mcp_server/server.py",
+    "mcp_server/capture_server.py",
+    "scripts/dev_e2e.py",
+    "scripts/eval_thread_classifier.py",
+    "scripts/pilot_demo.py",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+pythonpath = ["src"]
+markers = [
+    # Calls a real model through a real sandbox. Skipped when the provider is not
+    # usable, so an absent CLI or credential never makes the suite red.
+    "slow: exercises a real provider or sandbox end to end",
+]
+
+[tool.coverage.run]
+branch = true
+relative_files = true
+source = ["src/kojutsu", "mcp_server"]
+
+[tool.coverage.report]
+# A floor, not a target, and it is blocking on purpose.
+#
+# 84.68% is what this suite actually reports today (11077 statement/branch
+# opportunities). Setting the floor at 82 leaves about 300 uncovered
+# opportunities of headroom — roughly 3% — which is the ordinary cost of a
+# feature landing before its tests do, and is what keeps the gate from firing on
+# a PR that did nothing but add code. The previous floor was 70: fourteen points
+# below reality, which is a floor that cannot fail and therefore reports nothing.
+#
+# It blocks rather than annotates because the failure mode of a *reporting* gate
+# is that nobody reads the report, coverage falls for a year, and the day the
+# floor is raised the delta is unpayable and gets disabled instead. A gate that
+# fires on a real regression is worth the occasional false alarm on a feature PR:
+# that one gets a test, or gets `fail_under` lowered **in the same commit that
+# explains why**, which is a conversation rather than a silence.
+#
+# The lever for real headroom pressure is more tests, not a lower number.
+fail_under = 82
+show_missing = true
+skip_covered = true

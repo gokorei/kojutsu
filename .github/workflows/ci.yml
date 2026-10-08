@@ -1,0 +1,290 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38
+        with:
+          python-version: ${{ matrix.python-version }}
+      - uses: astral-sh/setup-uv@cec208311dfd045dd5311c1add060b2062131d57
+      - name: Install locked dependencies
+        run: |
+          uv lock --check
+          uv sync --locked --all-extras --dev
+      - name: Lint
+        run: |
+          uv run ruff check src tests mcp_server scripts app.py
+          uv run ruff format --check src tests mcp_server scripts app.py
+      - name: Typecheck
+        run: uv run mypy
+      - name: Test
+        # Coverage is collected here because this is where the data has to come
+        # from; the floor lives in pyproject.toml, so there is one number and a
+        # local `pytest --cov` enforces the same gate CI does.
+        run: uv run pytest --cov=src/kojutsu --cov=mcp_server --cov-report=term-missing -q
+      - name: Report coverage
+        # Annotates the run rather than gating it. The gate is `fail_under` in
+        # pyproject.toml and it already failed the Test step if it was going to;
+        # this exists so the number and its per-file shape are readable in the
+        # job summary, which is where somebody looks when deciding whether to
+        # write a test or lower the floor.
+        run: |
+          uv run coverage report --format=markdown --precision=2 >> "$GITHUB_STEP_SUMMARY"
+          echo >> "$GITHUB_STEP_SUMMARY"
+      - name: Validate documentation
+        run: uv run python scripts/check_docs.py
+
+  # The seam is a contract with another process, and this is the only place it is
+  # checked against one. Everything else in CI proves Kojutsu agrees with its
+  # own idea of Tanseki: an in-process fake answers from a dict the test filled in, so
+  # it cannot derive an edge from frontmatter, cannot refuse an over-cap listing,
+  # and cannot tell a server-side filter from none at all.
+  #
+  # Not on the Python matrix. A Gradle build plus a JVM daemon is minutes rather
+  # than seconds, the cost does not vary with the interpreter, and the guarantees
+  # under test are protocol shapes that 3.11/3.12/3.13 agree about identically.
+  # Multiplying it by three would buy three copies of the same assertion and three
+  # chances to time out. 3.11 stays the version the rest of the workflow pins, so
+  # one interpreter is being tested against the store in this repository already.
+  tanseki-e2e:
+    runs-on: ubuntu-latest
+    needs: quality
+    env:
+      # Repository variables (Settings -> Secrets and variables -> Actions ->
+      # Variables). Values to set:
+      #
+      # TANSEKI_REPOSITORY: gokorei/tanseki — the owner/repo slug, not a clone
+      #   URL. It feeds actions/checkout's `repository` input, which expects the
+      #   slug form; a URL fails as "repository not found" on the first run
+      #   rather than as a wrong answer.
+      # TANSEKI_REF: the ref to build. Pin an immutable commit SHA, not a branch: a
+      #   branch means the store Kojutsu is verified against can change under a
+      #   green run, so the check reports on a version nobody can name. A SHA makes a
+      #   failure attributable to a specific Tanseki build, and a deliberate bump to a
+      #   newer SHA is a reviewable diff rather than something that happens on a
+      #   Tuesday. Same reason the actions above are pinned by commit.
+      #
+      # Both are workflow-level env rather than hardcoded values so that filling them
+      # in is a one-line diff, and so an unset value is visible in review rather than
+      # hidden in a shell variable three steps down.
+      TANSEKI_REPOSITORY: ${{ vars.TANSEKI_REPOSITORY }}
+      TANSEKI_REF: ${{ vars.TANSEKI_REF }}
+      # The Gradle task that produces the distribution, rather than the path to the
+      # binary, so the layout is the Tanseki repo's to decide and not duplicated here.
+      TANSEKI_DISTRIBUTION_TASK: ":service:installDist"
+      # Deliberately not 8088 or 8099, which start.sh and scripts/dev-e2e.sh already
+      # use on a developer's machine. There is nothing to collide with inside this
+      # job -- it is not on the Python matrix, so it runs on one runner of its own --
+      # but a port already in use locally is a confusing way for this to fail first.
+      TANSEKI_PORT: "18100"
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38
+        with:
+          python-version: "3.11"
+      - uses: astral-sh/setup-uv@cec208311dfd045dd5311c1add060b2062131d57
+      - name: Install locked dependencies
+        run: uv sync --locked --all-extras --dev
+      - name: Set up JDK 21
+        # Pinned to the v4.9.1 commit, like every other action in this file.
+        # JDK 21 is what docs/tanseki-quickstart.md requires.
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Resolve the Tanseki build
+        id: tanseki
+        run: |
+          set -euo pipefail
+          # Fails the job rather than skipping it. An unfilled variable means nobody
+          # has said which store Kojutsu is verified against, and a green run that
+          # checked nothing is the outcome this exists to prevent -- so the absence is
+          # a red build with an instruction in it, not a silent pass.
+          if [[ -z "$TANSEKI_REPOSITORY" || -z "$TANSEKI_REF" ]]; then
+            echo "::error::TANSEKI_REPOSITORY and TANSEKI_REF must both be set as repository" \
+              "variables (Settings -> Secrets and variables -> Actions -> Variables)." \
+              "Without them there is no store to check the seam against, and a job" \
+              "pointing at a guessed URL is worse than no job."
+            exit 1
+          fi
+          echo "repository=$TANSEKI_REPOSITORY" >> "$GITHUB_OUTPUT"
+          echo "ref=$TANSEKI_REF" >> "$GITHUB_OUTPUT"
+      - name: Check out Tanseki at the pinned ref
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: ${{ steps.tanseki.outputs.repository }}
+          ref: ${{ steps.tanseki.outputs.ref }}
+          path: tanseki
+          persist-credentials: false
+      - name: Build the Tanseki distribution
+        working-directory: tanseki
+        run: ./gradlew $TANSEKI_DISTRIBUTION_TASK --no-daemon
+      - name: Start tanseki-daemon on a throwaway vault
+        id: daemon
+        run: |
+          set -euo pipefail
+          # A vault per run rather than a shared one: the daemon initialises it as a
+          # Pijul repo on first write, and a reused vault would carry documents between
+          # runs, so an exact-count assertion would be asserting on a leftover.
+          WORK="$(mktemp -d)"
+          echo "work=$WORK" >> "$GITHUB_OUTPUT"
+          echo "port=$TANSEKI_PORT" >> "$GITHUB_OUTPUT"
+          PORT="$TANSEKI_PORT"
+          mkdir -p "$WORK/vault"
+          TANSEKI_PATH="$WORK/vault" \
+          TANSEKI_INDEX_DIR="$WORK/index" \
+          TANSEKI_SOCKET="$WORK/tanseki.sock" \
+          TANSEKI_HTTP_PORT="$PORT" \
+            tanseki/service/build/install/tanseki-daemon/bin/tanseki-daemon \
+            >"$WORK/daemon.log" 2>&1 &
+          echo "$!" > "$WORK/daemon.pid"
+          # Bounded, not open-ended: a daemon that never binds must fail the job with
+          # its log rather than leave this step running until the runner is reclaimed.
+          code=""
+          for _ in $(seq 1 60); do
+            code="$(curl -s -o /dev/null -w '%{http_code}' \
+              "http://127.0.0.1:$PORT/v1/health" || true)"
+            [[ "$code" == "200" ]] && break
+            sleep 2
+          done
+          if [[ "$code" != "200" ]]; then
+            echo "::error::tanseki-daemon did not become healthy on :$PORT (last status ${code:-none})"
+            tail -50 "$WORK/daemon.log" || true
+            exit 1
+          fi
+          echo "tanseki-daemon healthy on :$PORT"
+      - name: Run the cross-seam E2E against it
+        env:
+          TANSEKI_URL: http://127.0.0.1:${{ steps.daemon.outputs.port }}
+          TANSEKI_COLLECTION: kojutsu-e2e-ci
+        run: |
+          set -euo pipefail
+          # -p no:cacheprovider keeps a stale lastfailed from a previous run out of
+          # this one, and the tests are the only coverage source here so --cov is not
+          # attached: the floor belongs to the quality job, which owns the number.
+          uv run pytest -q -rs -p no:cacheprovider \
+            tests/integration/test_tanseki_daemon_e2e.py
+      - name: Stop tanseki-daemon
+        # Always, not only on success. A daemon left running holds its vault and its
+        # port until the runner is reclaimed, so a leak here shows up as the next run
+        # of this job failing to bind rather than as this run's failure.
+        if: always()
+        run: |
+          WORK="${{ steps.daemon.outputs.work }}"
+          [[ -n "$WORK" ]] || exit 0
+          if [[ -f "$WORK/daemon.pid" ]]; then
+            PID="$(cat "$WORK/daemon.pid")"
+            kill "$PID" 2>/dev/null || true
+            # `wait` in a different step cannot see a process this step did not
+            # start, so poll for the port to be released instead of assuming.
+            for _ in $(seq 1 15); do
+              kill -0 "$PID" 2>/dev/null || break
+              sleep 1
+            done
+            kill -9 "$PID" 2>/dev/null || true
+          fi
+      - name: Report the daemon log
+        # Always. A failure in the E2E is nearly always explained by something the
+        # daemon printed, and a log that is only reported when the step before it
+        # happened to succeed is a log nobody has at the moment they need it.
+        if: always()
+        run: |
+          WORK="${{ steps.daemon.outputs.work }}"
+          {
+            echo "### tanseki-daemon log"
+            echo
+            echo '```'
+            tail -100 "${WORK:-/nonexistent}/daemon.log" 2>&1 || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  package:
+    runs-on: ubuntu-latest
+    needs: quality
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38
+        with:
+          python-version: "3.11"
+      - uses: astral-sh/setup-uv@cec208311dfd045dd5311c1add060b2062131d57
+      - name: Build distributions
+        run: uv build --out-dir dist
+      - name: Install wheel in a clean environment
+        run: |
+          uv venv --python 3.11 .package-venv
+          uv pip install --python .package-venv/bin/python dist/*.whl
+      - name: Smoke test entry points
+        # One line per console script in [project.scripts], deliberately not a sample.
+        # A server entry point that stops resolving in the wheel is invisible to every
+        # other step here -- both MCP servers are stdio, so the failure is a spawn
+        # error at the client's first call rather than anything a test reports. Each is
+        # fed empty stdin, which is what makes a stdio server exit 0 on its own; `--help`
+        # would read as a frame and fail instead.
+        run: |
+          .package-venv/bin/kojutsu --help >/dev/null
+          printf '' | .package-venv/bin/kojutsu-mcp
+          printf '' | .package-venv/bin/kojutsu-capture
+      - name: Smoke test packaged ASGI app
+        run: |
+          .package-venv/bin/python - <<'PY'
+          from fastapi.testclient import TestClient
+          from kojutsu.asgi import app
+          with TestClient(app) as client:
+              assert client.get("/webhook/health").status_code == 200
+          PY
+
+  docker:
+    runs-on: ubuntu-latest
+    needs: quality
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Build image
+        run: |
+          if ! docker info >/dev/null 2>&1; then
+            echo "Docker daemon unavailable; skipping image smoke."
+            exit 0
+          fi
+          docker build --tag kojutsu:ci .
+      - name: Smoke test image ASGI app
+        run: |
+          if ! docker image inspect kojutsu:ci >/dev/null 2>&1; then
+            echo "Image was not built; skipping image smoke."
+            exit 0
+          fi
+          docker run --rm kojutsu:ci python - <<'PY'
+          from fastapi.testclient import TestClient
+          from kojutsu.asgi import app
+          with TestClient(app) as client:
+              assert client.get("/webhook/health").status_code == 200
+          PY
+
+  audit:
+
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38
+        with:
+          python-version: "3.11"
+      - uses: astral-sh/setup-uv@cec208311dfd045dd5311c1add060b2062131d57
+      - name: Install locked dependencies
+        run: uv sync --locked --all-extras --dev
+      - name: Audit dependencies
+        run: uv run pip-audit --strict --progress-spinner off

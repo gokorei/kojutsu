@@ -1,0 +1,77 @@
+# Kojutsu configuration. Committed, reviewed, and holding no credentials --
+# the loader refuses a credential-named key with a non-empty value. Put tokens in
+# .env or the environment. See docs/configuration.md.
+#
+# Precedence, highest first: constructor arguments, environment, the instance
+# table below, [defaults] below that, then .env. The committed file outranks .env
+# because .env is untracked and per-machine: if .env won, the file in a diff would
+# be a document with no effect and reviewing it would be theatre.
+#
+# THE REPOSITORIES BELOW ARE PLACEHOLDERS, and that has a consequence worth stating
+# rather than discovering. Because this file outranks .env, naming a repository here
+# OVERRIDES whatever your .env allows -- so `kojutsu --instance real backfill
+# --repo your-org/your-repo` is refused, with `acme/widgets` as the scope, until you
+# replace these with your own. Two ways to run: put your repositories here and
+# commit them, which is the point of the file; or delete these keys so .env supplies
+# the scope and this file only carries what is genuinely shared. Nothing is inferred
+# from the placeholder -- an unrecognised repository is refused, never widened.
+
+[defaults]
+# Shared by every instance: where the store is, and which model answers questions.
+tanseki_url = "http://127.0.0.1:8088"
+llm_provider = "opencode"
+llm_model = "opencode/model"
+llm_external_enabled = true
+
+[instances.real]
+# The corpus with real webhook captures and the classifier measurement.
+tanseki_collection = "kojutsu-real"
+github_webhook_allowed_repositories = ["acme/widgets"]
+llm_allowed_repositories = ["acme/widgets"]
+
+[instances.secondary]
+# Read-only backfill of a public organisation. Separate registry and outbox, because
+# two corpora sharing one outbox would interleave their deliveries.
+tanseki_collection = "kojutsu-secondary"
+# `fastapi/fastapi` is here to be reconstructed by `backfill-reviews`, which
+# authorises against this same list ("a backfill reads only what capture is allowed to
+# write"), so admitting it here is what lets that command read the repository at all.
+# The acme/* entries are the documented placeholders and stay.
+#
+# Named by its CURRENT full name, not `tiangolo/fastapi`, which the project used until
+# it moved to its own organisation. The old path answers 301, and `backfill-reviews`
+# stops on a redirect rather than following it -- so the correct spelling is the only
+# thing that reads this repository at all. If the project moves again, this entry goes
+# stale silently until a run fails with a 301 rather than a clear "unknown repository".
+#
+# It is deliberately NOT in `llm_allowed_repositories`, which this instance does not
+# set. Reconstruction reads history; it never asks anybody anything, and adding the
+# repository to the model allowlist would authorise sending it to the LLM for no
+# reason this corpus needs.
+github_webhook_allowed_repositories = [
+    "acme/service",
+    "acme/library",
+    "fastapi/fastapi",
+]
+kojutsu_registry_path = "~/.kojutsu/registry-secondary.db"
+tanseki_outbox_path = "~/.kojutsu/tanseki-outbox-secondary.db"
+
+[instances.tertiary]
+# Reconstructed review history for pingdotgg/t3code. Its own instance rather than a
+# second repository under `secondary`, because the two corpora are not more or less of
+# the same thing: fastapi's reviews are overwhelmingly human, and roughly four in
+# five of t3code's are authored by review bots. Pooling them would put bot records in
+# the denominator of every reviewer-count measure and report a number describing
+# neither project. Separate registry and outbox for the reason `secondary` has them.
+tanseki_collection = "kojutsu-tertiary"
+github_webhook_allowed_repositories = ["pingdotgg/t3code"]
+kojutsu_registry_path = "~/.kojutsu/registry-tertiary.db"
+tanseki_outbox_path = "~/.kojutsu/tanseki-outbox-tertiary.db"
+
+[instances.pilot]
+# Synthetic records from the demo agents. No repository may be sent to the model,
+# so the allowlists are empty rather than unset: unset and empty read the same here,
+# and writing them down says it was a decision.
+tanseki_collection = "kojutsu-pilot"
+github_webhook_allowed_repositories = []
+llm_allowed_repositories = []

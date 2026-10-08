@@ -1,0 +1,902 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<link rel="icon" href="data:," />
+<title>Kojutsu — captured knowledge</title>
+<style>
+  :root { --bg:#0f1115; --panel:#171a21; --fg:#e6e8ee; --muted:#8b93a7;
+          --accent:#6ea8fe; --ok:#3fb950; --bad:#f85149; --warn:#d29922;
+          --line:#262b36; --cat1:#6ea8fe; --cat2:#3fb950; --cat3:#d29922;
+          --cat4:#bc8cff; --cat5:#f778ba; --cat6:#56d4dd; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font:14px/1.55 ui-sans-serif,-apple-system,Segoe UI,Roboto,sans-serif; }
+  header { padding:16px 20px; border-bottom:1px solid var(--line);
+           display:flex; gap:14px; align-items:baseline; flex-wrap:wrap; }
+  h1 { margin:0; font-size:15px; font-weight:650; letter-spacing:.01em; }
+  h2 { margin:0 0 12px; font-size:11px; text-transform:uppercase;
+       letter-spacing:.09em; color:var(--muted); font-weight:600; }
+  #meta { color:var(--muted); font-size:12px; }
+  main { display:grid; grid-template-columns:repeat(4,1fr); gap:14px; padding:16px 20px 32px;
+         max-width:1500px; }
+  .wide { grid-column:span 2; }
+  @media (max-width:1000px) { main { grid-template-columns:repeat(2,1fr); } .wide { grid-column:span 2; } }
+  @media (max-width:640px) { main { grid-template-columns:1fr; } .wide { grid-column:span 1; } }
+  section { background:var(--panel); border:1px solid var(--line);
+            border-radius:10px; padding:14px; min-width:0; }
+  .kpis { grid-column:1/-1; display:grid; grid-template-columns:repeat(4,1fr); gap:14px; }
+  @media (max-width:1000px) { .kpis { grid-template-columns:repeat(2,1fr); } }
+  @media (max-width:640px) { .kpis { grid-template-columns:repeat(2,1fr); } }
+  .kpi { background:var(--panel); border:1px solid var(--line);
+         border-radius:10px; padding:12px 14px; }
+  .kpi .n { font-size:26px; font-weight:650; line-height:1.1;
+            font-variant-numeric:tabular-nums; }
+  .kpi .l { color:var(--muted); font-size:11px; text-transform:uppercase;
+            letter-spacing:.07em; margin-top:3px; }
+  .bar-row { display:grid; grid-template-columns:minmax(70px,26%) 1fr auto;
+             gap:8px; align-items:center; margin-bottom:6px; font-size:12px; }
+  .bar-row .k { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .bar-track { background:#0c0e13; border-radius:4px; height:9px; overflow:hidden; }
+  .bar-fill { height:100%; background:var(--accent); border-radius:4px; min-width:2px; }
+  .bar-row .v { color:var(--muted); font-variant-numeric:tabular-nums; }
+  #timeline { display:flex; align-items:flex-end; gap:2px; height:96px; }
+  #timeline .col { flex:1 1 0; min-width:3px; display:flex; flex-direction:column;
+                   justify-content:flex-end; height:100%; position:relative; }
+  #timeline .col > i { display:block; background:var(--accent); border-radius:2px 2px 0 0;
+                       min-height:2px; }
+  #timeline .col:hover > i { background:var(--ok); }
+  #timeline .col::after { content:attr(data-tip); position:absolute; bottom:100%;
+                          left:50%; transform:translate(-50%,-4px); display:none;
+                          background:#0c0e13; border:1px solid var(--line); color:var(--fg);
+                          padding:3px 7px; border-radius:5px; font-size:11px; white-space:nowrap;
+                          z-index:5; }
+  #timeline .col:hover::after { display:block; }
+  .axis { display:flex; justify-content:space-between; color:var(--muted);
+          font-size:11px; margin-top:6px; }
+  form { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:12px; }
+  input, select { background:#0c0e13; border:1px solid var(--line); color:var(--fg);
+                  border-radius:6px; padding:6px 8px; font:inherit; font-size:12px; }
+  input[name=q] { flex:1 1 200px; }
+  ul { list-style:none; margin:0; padding:0; }
+  /* Cap the list so the summary panels stay on screen during a demo. */
+  #captures { max-height:60vh; overflow-y:auto; padding-right:6px; }
+  li.cap { padding:10px 0; border-bottom:1px solid var(--line); }
+  li.cap:last-child { border-bottom:0; }
+  .cap-top { display:flex; gap:8px; align-items:baseline; flex-wrap:wrap; margin-bottom:4px; }
+  .q { font-weight:600; }
+  .chip { font-size:10px; text-transform:uppercase; letter-spacing:.06em;
+          border:1px solid var(--line); border-radius:999px; padding:1px 7px;
+          color:var(--muted); white-space:nowrap; }
+  .chip a { color:inherit; text-decoration:none; }
+  .chip a:hover { color:var(--accent); }
+  .chip.warn { color:var(--bad); border-color:var(--bad); }
+  .who { color:var(--muted); font-size:11px; margin-bottom:6px; }
+  .who span + span::before { content:" · "; }
+  .note { color:var(--muted); font-size:11px; margin-top:8px; }
+  /* Its own class rather than `wide`, which means span 2: a half-width note
+   * displaces the next full-width panel onto a shared row and leaves a hole. */
+  .note.full { grid-column:1/-1; margin:0; padding:0 2px; }
+  .a { color:#c3c9d6; white-space:pre-wrap; word-break:break-word; }
+  code { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:.92em;
+         background:#0c0e13; border:1px solid var(--line); border-radius:4px;
+         padding:0 3px; }
+  .when { color:var(--muted); font-size:11px; margin-left:auto; white-space:nowrap; }
+  .empty { color:var(--muted); padding:8px 0; }
+  #drop { border:1px dashed var(--line); border-radius:8px; padding:10px;
+          color:var(--muted); font-size:12px; text-align:center; }
+  #drop.hot { border-color:var(--accent); color:var(--accent); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Kojutsu — captured knowledge</h1>
+  <div id="meta">loading…</div>
+</header>
+<main>
+  <div class="kpis" id="kpis"></div>
+  <div class="note full" id="kpi-note"></div>
+
+  <section class="wide">
+    <h2>Captures over time</h2>
+    <div id="timeline"></div>
+    <div class="axis"><span id="axis-start"></span><span id="axis-end"></span></div>
+  </section>
+
+  <section>
+    <h2>By capture source</h2>
+    <div id="by-source"><div class="empty">No data.</div></div>
+    <div class="note" id="source-note"></div>
+  </section>
+
+  <section>
+    <h2>Answered by</h2>
+    <div id="by-agent"><div class="empty">No data.</div></div>
+    <div class="note" id="by-agent-note">Agent that drafted the answer.</div>
+  </section>
+
+  <section>
+    <h2>Attributed to</h2>
+    <div id="by-human"><div class="empty">No data.</div></div>
+    <div class="note">Human the answer is attributed to on GitHub.</div>
+  </section>
+
+  <section>
+    <h2>By category</h2>
+    <div id="by-category"><div class="empty">No data.</div></div>
+  </section>
+
+  <section class="wide">
+    <h2>Captures</h2>
+    <form id="filters">
+      <input name="q" placeholder="search questions and answers" />
+      <select name="category"><option value="">all categories</option></select>
+      <select name="source"><option value="">all sources</option></select>
+      <select name="human"><option value="">all attributed to</option></select>
+      <select name="agent"><option value="">all agents</option></select>
+      <select name="structure"><option value="">all structures</option></select>
+      <select name="kind"><option value="">all record kinds</option></select>
+    </form>
+    <div class="note" id="filter-note"></div>
+    <ul id="captures"><li class="empty">No data.</li></ul>
+  </section>
+
+  <section class="wide">
+    <h2>Data source</h2>
+    <form id="source">
+      <input name="base" placeholder="console base URL" />
+      <select name="every">
+        <option value="0">manual</option>
+        <option value="5">refresh 5s</option>
+        <option value="10" selected>refresh 10s</option>
+        <option value="30">refresh 30s</option>
+        <option value="60">refresh 60s</option>
+      </select>
+      <button type="submit">Refresh now</button>
+    </form>
+    <div id="source-status" class="empty">connecting…</div>
+    <div id="drop" style="margin-top:10px">
+      Drop a <code>knowledge-snapshot.json</code> here to view a saved snapshot
+      instead, or
+      <label style="text-decoration:underline;cursor:pointer">choose a file<input id="file" type="file" accept=".json,application/json" hidden /></label>.
+    </div>
+  </section>
+</main>
+<script>
+const $ = (s) => document.querySelector(s);
+const el = (tag, cls, text) => {
+  const n = document.createElement(tag);
+  if (cls) n.className = cls;
+  if (text != null) n.textContent = text;
+  return n;
+};
+const CAT_COLORS = ['--cat1','--cat2','--cat3','--cat4','--cat5','--cat6'];
+const catColor = (name) => {
+  let h = 0;
+  for (const ch of name) h = (h * 31 + ch.codePointAt(0)) >>> 0;
+  return `var(${CAT_COLORS[h % CAT_COLORS.length]})`;
+};
+
+// Captured text is Markdown, and the questions lean on inline code for symbols
+// like `append.committed`. Render code spans and bold; escape everything first.
+const escapeHtml = (v) => String(v ?? '').replace(/[&<>"']/g,
+  (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const inlineMd = (v) => escapeHtml(v)
+  .replace(/`([^`]+)`/g, '<code>$1</code>')
+  .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+
+const inlineNode = (tag, cls, value) => {
+  const n = el(tag, cls);
+  n.innerHTML = inlineMd(value);
+  return n;
+};
+
+let CAPTURES = [];
+
+// Accept both a full snapshot and a bare array of captures, so a hand-trimmed
+// file still renders.
+function normalize(raw) {
+  if (Array.isArray(raw)) return { captures: raw, meta: {} };
+  if (!raw || typeof raw !== 'object') throw new Error('not a snapshot object');
+  return { captures: Array.isArray(raw.captures) ? raw.captures : [], meta: raw };
+}
+
+function tally(items, keyFn) {
+  const counts = new Map();
+  for (const c of items) {
+    const k = keyFn(c);
+    counts.set(k, (counts.get(k) || 0) + 1);
+  }
+  return [...counts.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+}
+
+function renderBars(node, rows, { colorFor, limit = 10 } = {}) {
+  node.replaceChildren();
+  if (!rows.length) { node.append(el('div', 'empty', 'No data.')); return; }
+  const shown = rows.slice(0, limit);
+  const max = shown[0][1];
+  for (const [key, n] of shown) {
+    const row = el('div', 'bar-row');
+    row.append(el('div', 'k', key));
+    const track = el('div', 'bar-track');
+    const fill = el('i', 'bar-fill');
+    fill.style.width = `${Math.max(2, (n / max) * 100)}%`;
+    fill.style.display = 'block';
+    if (colorFor) fill.style.background = colorFor(key);
+    track.append(fill);
+    row.append(track);
+    row.append(el('div', 'v', String(n)));
+    node.append(row);
+  }
+  if (rows.length > limit) {
+    node.append(el('div', 'empty', `+${rows.length - limit} more`));
+  }
+}
+
+function dayKey(iso) {
+  if (!iso) return null;
+  const d = new Date(iso);
+  return Number.isNaN(d.getTime()) ? null : d.toISOString().slice(0, 10);
+}
+
+function renderTimeline(items) {
+  const node = $('#timeline');
+  node.replaceChildren();
+  const days = new Map();
+  let undated = 0;
+  for (const c of items) {
+    const k = dayKey(c.answered_at);
+    if (k === null) { undated++; continue; }
+    days.set(k, (days.get(k) || 0) + 1);
+  }
+  if (!days.size) {
+    node.append(el('div', 'empty', 'No dated captures.'));
+    $('#axis-start').textContent = '';
+    $('#axis-end').textContent = undated ? `${undated} undated` : '';
+    return;
+  }
+  const keys = [...days.keys()].sort();
+  const max = Math.max(...keys.map((k) => days.get(k)));
+  for (const k of keys) {
+    const n = days.get(k);
+    const col = el('div', 'col');
+    col.dataset.tip = `${k} — ${n}`;
+    const bar = el('i');
+    bar.style.height = `${Math.max(3, (n / max) * 100)}%`;
+    col.append(bar);
+    node.append(col);
+  }
+  $('#axis-start').textContent = `${keys[0]} · ${days.get(keys[0])}`;
+  $('#axis-end').textContent = `${keys[keys.length - 1]} · ${days.get(keys[keys.length - 1])}`
+    + (undated ? ` · ${undated} undated` : '');
+}
+
+function renderKpis(items) {
+  const node = $('#kpis');
+  node.replaceChildren();
+  // Excludes measurements: `agent_authored` on an evaluation says a model ran the
+  // harness, which is true and answers nothing. Folding it in would report a
+  // program that graded itself as though it had answered a question.
+  const agentAuthored = items.filter((c) => c.agent_authored && !isEvaluation(c)).length;
+  const verified = items.filter((c) => c.capture_source === 'webhook').length;
+  const humans = new Set(items.map((c) => c.comment_author).filter(Boolean));
+  const kpis = [
+    // A clarification is a capture — it came from a real comment — so it stays in
+    // the capture total. What it is not is an answer, which is why it also gets
+    // its own count below: a reader told "40 captures" should be able to ask how
+    // many of them answer a question at all.
+    // An evaluation is excluded here as well, and for a stronger reason than a
+    // rationale's: a rationale is at least a statement somebody made. A measurement
+    // is a number this system computed about itself, and counting it as a capture
+    // would put a figure derived from a model on the same line as eleven figures a
+    // person produced by answering a question.
+    ['captures', items.filter((c) =>
+        !isRationaleLike(c) && !isObservation(c) && !isQuestion(c)).length],
+    // Counted apart, never inside the capture total. A rationale is a claim by an
+    // agent about its own work, so counting it as a capture would let the headline
+    // number imply evidence the record does not carry.
+    // Counted apart from the capture total, and this is the figure that bounds it.
+    // A census record says a delivery was processed and nothing came of it; folded
+    // into "captures" it would turn "we observed this and got nothing" into "we
+    // captured this" -- the exact claim the census was built to avoid, and
+    // invisible because the total still looks like a total.
+    ['observations', items.filter(isObservation).length],
+    ['questions', items.filter(isQuestion).length],
+    // The one rate on this page, and it is deliberately *not* a bare percentage.
+    // A capture rate over a self-selected numerator is the misreading this whole
+    // effort exists to remove: "40 captures" invites "out of what?", and until the
+    // census existed the honest answer was unknowable. Now it is not, so the figure
+    // carries its own denominator rather than leaving the reader to supply one --
+    // and it sits next to the observation count, because the two are one ratio split
+    // in two and a reader should not have to hunt for the other term.
+    //
+    // The denominator counts *records*, not changes. One change can legitimately
+    // carry both an observation and a capture, so a change-based rate would have to
+    // pick a side of that; this one says plainly which unit it is using.
+    ['capture rate', captureRate(items)],
+    // Reported, never folded anywhere. A kind this build cannot resolve is a record
+    // nobody has written a renderer for, and counting it as a capture is how a
+    // store starts reporting itself as something it is not.
+    ['unaccounted', items.filter(isUnaccounted).length],
+    ['rationales', items.filter((c) => c.kind === 'rationale').length],
+    ['clarifications', items.filter(isClarification).length],
+    ['evaluations', items.filter(isEvaluation).length],
+    // The one figure on this row phrased as a conversation, and the reason the
+    // others are not. "Captures" counts records; this counts records somebody was
+    // on record as being asked a question and answering it. An inferred pairing is
+    // excluded, because a model matched the two sides and no question was put to
+    // anyone — a reader who wanted "how many questions were asked and answered"
+    // would otherwise take a number that is flattering and wrong, and would have
+    // no way to tell. The exclusions are counted in the note beneath the row
+    // rather than absorbed here.
+    ['asked & answered', items.filter(isAskedQuestion).length],
+    // Categories count captures only. A clarification has no question, so it has
+    // no category; counting it here would put an empty "uncategorized" bucket on
+    // an axis whose whole meaning is a question that was asked.
+    ['categories', new Set(items.filter((c) => c.kind === 'capture')
+      .map((c) => c.category || 'uncategorized')).size],
+    ['agent-authored', agentAuthored],
+    ['via webhook', `${verified}/${items.length}`],
+    ['humans', humans.size],
+    ['jira-linked', items.filter((c) => c.jira).length],
+  ];
+  for (const [label, n] of kpis) {
+    const card = el('div', 'kpi');
+    card.append(el('div', 'n', String(n)), el('div', 'l', label));
+    node.append(card);
+  }
+}
+
+// A rationale is permanently asserted, so it is never webhook-delivered and would
+// otherwise be swept into the "not verified" count alongside forged captures.
+// It is a different kind of record, not a less trustworthy capture.
+const isRationale = (c) => c.kind === 'rationale';
+// A model matched this question to this answer; nobody necessarily asked. The
+// text is as checkable as any other capture, which is exactly why it needs its
+// own badge: a reader skimming the capture column would otherwise read an
+// inferred pairing as a conversation somebody had.
+// An observation: a delivery that was processed and produced nothing. Its kind is
+// resolved by the console, and it is never a capture.
+const isObservation = (c) => c.kind === 'census';
+// Every kind the console reports other than a capture. Kept as one predicate so
+// the capture total cannot drift from the set of kinds it excludes.
+// Kinds excluded from the capture total. Deliberately NOT clarifications: they are
+// captured evidence about a comment, and main counts them inside the total and
+// separately by heading. This predicate exists so the capture total cannot drift
+// from the set of kinds it excludes.
+const isRationaleLike = (c) => c.kind === 'rationale' || isEvaluation(c) || isUnaccounted(c);
+// A decision request. Not a capture that found nothing to say -- a request.
+const isQuestion = (c) => c.kind === 'question';
+// Either failure to classify: the document named no kind, or named one this build
+// cannot read. Both are reported rather than counted, because a count that looks
+// complete while absorbing an unknown kind is the failure the whole page is built
+// to prevent.
+const isUnaccounted = (c) => c.kind === 'undeclared' || c.kind === 'unrecognised';
+
+// Captures as a fraction of everything that was observed, with both terms named.
+// No denominator at all is possible when nothing was captured -- the answer is
+// "we do not know yet", not 0% and not 100%, and saying either would be a claim
+// about a corpus that has not been observed yet.
+const captureRate = (items) => {
+  const captures = items.filter((c) =>
+    !isRationaleLike(c) && !isObservation(c) && !isQuestion(c)).length;
+  const observations = items.filter(isObservation).length;
+  const observed = captures + observations;
+  if (!observed) return 'nothing observed yet';
+  return `${Math.round((captures / observed) * 100)}% of ${observed} observed`;
+};
+const isInferred = (c) => c.structure === 'inferred';
+// A clarification is the mirror case: real evidence that simply has no question
+// attached. Its anchor is the comment id, and ``collect`` is as real a capture
+// channel as a webhook delivery — so it is never badged unverified either. The
+// badge means "in the store but nobody vouched for it", which is the opposite of
+// what a captured comment is.
+const isClarification = (c) => c.kind === 'clarification';
+// An evaluation is not a capture at all: it is a number this system produced by
+// running a model, about a model. It is the one kind that must never be folded into
+// the capture total, because a report filed beside real records reads as another
+// real record. It is also permanently asserted, so the unverified badge libels it in
+// a third direction — nothing vouched for it and nothing was supposed to.
+const isEvaluation = (c) => c.kind === 'evaluation';
+// A capture that was asserted rather than delivered by the webhook is the
+// forged-agent-report case: it is in the store but nobody vouched for it.
+const isUnverified = (c) => c.capture_source && c.capture_source !== 'webhook';
+// The two record kinds that are not ordinary captures are never called
+// unverified: one is a claim by an agent, the other is a quotation. Neither is a
+// capture that failed verification, and the badge would libel them in opposite
+// directions.
+const isBadgedUnverified = (c) => isUnverified(c) && !isRationale(c) && !isClarification(c)
+  && !isEvaluation(c);
+// Neither kind has a question category, so neither may be filtered or tallied on
+// that axis.
+// Whether this record can carry a question category at all. Every value in that
+// vocabulary is retrospective -- it names a kind of decision, after the fact -- so
+// only something that answers a question can hold one. A rationale and a
+// clarification have no question, and neither does a decision *request* or an
+// observation: the first asks and is unanswered, the second records that nothing was
+// captured. Filing any of them under "uncategorized" puts an empty bucket on an axis
+// whose whole meaning is a question that was asked.
+const hasCategory = (c) =>
+  !isRationale(c) && !isClarification(c) && !isObservation(c) && !isQuestion(c);
+// A structure this build cannot read is not an anchored pairing. It is excluded
+// from every "asked" count and it is badged, because resolving it to anchored
+// would be a claim about the store made by this page rather than by its writer.
+const isAnchored = (c) => c.structure === 'anchored';
+// Every structure value, for the filter. Reported as the store has it, including
+// the two the page cannot vouch for, so a filter that hides a record can always
+// name what it hid.
+const structureOf = (c) => c.structure || 'unknown';
+// The kind a row resolved to, which is what the kind filter compares against.
+const kindOf = (c) => c.kind || 'undeclared';
+// Counts only records that are a capture a person was on record as being asked.
+// Inferred pairings are excluded: a model matched the two sides, so nobody is on
+// record as having asked anything, and a figure phrased as questions asked or
+// answered that included them would be flattering and wrong.
+const isAskedQuestion = (c) => c.kind === 'capture' && isAnchored(c);
+
+function whenLabel(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return String(iso);
+  return d.toISOString().replace('T', ' ').slice(0, 16);
+}
+
+function renderCaptures() {
+  const form = $('#filters');
+  const q = (form.q.value || '').trim().toLowerCase();
+  const category = form.category.value;
+  const source = form.source.value;
+  const human = form.human.value;
+  const agent = form.agent.value;
+  const structure = form.structure.value;
+  const kind = form.kind.value;
+  const list = $('#captures');
+  const note = $('#filter-note');
+  note.textContent = '';
+  list.replaceChildren();
+
+  // The structure filter is counted before it is applied, and the count is shown,
+  // because a filter that drops records in silence turns "no anchored records here"
+  // into a claim about the store that the store does not make. The MCP read path
+  // already established the rule with ``anchored_only``: exclusions are counted and
+  // named. Same rule, same reason — the reader has to be able to tell the
+  // difference between "the store has nothing" and "I asked for a narrower slice".
+  const excluded = structure
+    ? CAPTURES.filter((c) => structureOf(c) !== structure)
+    : [];
+
+  const rows = CAPTURES.filter((c) => {
+    // A record kind with no question cannot match a question category, so a
+    // category filter hides it rather than quietly dropping it into "uncategorized".
+    if (category && (!hasCategory(c) || (c.category || 'uncategorized') !== category)) return false;
+    if (source && (c.capture_source || 'unknown') !== source) return false;
+    if (human && (c.comment_author || 'unattributed') !== human) return false;
+    if (agent && (c.answered_by_agent || c.author || 'unknown') !== agent) return false;
+    if (structure && structureOf(c) !== structure) return false;
+    if (kind && kindOf(c) !== kind) return false;
+    if (q) {
+      const hay = `${c.title || ''} ${c.answer || ''} ${c.jira || ''}`.toLowerCase();
+      if (!hay.includes(q)) return false;
+    }
+    return true;
+  });
+
+  if (excluded.length) {
+    // Named by breakdown, not just totalled: a count of 3 is a number, and the
+    // reader still cannot tell whether they are reading 3 inferred pairings or 3
+    // records whose structure this build cannot read. Those are different claims
+    // about the store, and only the second one is about the store being broken.
+    const breakdown = tally(excluded, structureOf)
+      .map(([k, n]) => `${n} ${k}`).join(', ');
+    note.append(el('span', null,
+      `Showing ${structure} only — ${excluded.length} of ${CAPTURES.length} records `
+      + `excluded (${breakdown}). They are in the store; widen the filter to see them.`));
+  }
+
+  if (!rows.length) {
+    list.append(el('li', 'empty', CAPTURES.length ? 'No captures match these filters.' : 'No data.'));
+    return;
+  }
+  for (const c of rows) {
+    const li = el('li', 'cap');
+    const top = el('div', 'cap-top');
+    if (isObservation(c) || isQuestion(c)) {
+      top.append(el('span', 'chip', c.kind));
+      const label = isObservation(c)
+        ? (c.title || 'observed, nothing captured')
+        : (c.title || 'decision request');
+      top.append(el('span', 'q', label));
+      if (isObservation(c)) {
+        // The action and the delivery, because those are what make the row an
+        // observation rather than a gap: the action says what was seen, and the
+        // delivery id is the one thing a reader can re-fetch to check it.
+        if (c.observation_action) top.append(el('span', 'chip', c.observation_action));
+        if (c.observation_delivery_id) {
+          top.append(el('span', 'chip', `delivery ${c.observation_delivery_id}`));
+        }
+      } else {
+        // Who asked. A decision request with no asker on the row is a request
+        // floating free of the person who made it, which is the one fact a reader
+        // needs before deciding whether to answer.
+        const asker = c.author || c.question_author;
+        if (asker) top.append(el('span', 'chip', `asked by ${asker}`));
+      }
+      // Formatted and classed like every other row. This branch was appending the
+      // raw ISO string under a `meta` class, so an observation was the only row on
+      // the page showing "2026-09-30T12:00:00+00:00" where every other record read
+      // "2026-09-30 12:00" — which is the kind of inconsistency that makes a reader
+      // suspect the record is a different kind of thing rather than a differently
+      // shaped row.
+      top.append(el('span', 'when', whenLabel(c.answered_at)));
+      // The list item, not the row: `list` is a <ul> and every other row arrives as
+      // an <li class="cap"> wrapping a <div class="cap-top">`. Appending the inner
+      // div here put a bare div in the list, so an observation rendered as a block
+      // where the rest of the page expects a row -- and the filter's own row counting
+      // could not see it.
+      li.append(top);
+      list.append(li);
+      // `continue`, not `return`. This branch sits directly inside the `for (const c
+      // of rows)` loop, so a `return` here leaves `renderCaptures` altogether and
+      // every record *after* this one is dropped from the list without a word. The
+      // list is rebuilt from scratch on every render, so the loss is invisible: a
+      // corpus holding one observation quietly showed fewer records than it had, and
+      // the only symptom was a count that did not match. Exactly the silent
+      // absorption this page exists to prevent, caused by the page itself.
+      continue;
+    }
+    top.append(inlineNode('span', 'q', isRationale(c)
+      ? (c.title || 'stated rationale')
+      : isEvaluation(c)
+        ? (c.title || `evaluation of ${c.evaluated_model || 'a model'}`)
+        : (c.title || '(untitled question)')));
+    // Neither a rationale's nor a clarification's `category` is a question
+    // category, so both are labelled as what they are rather than shown on that
+    // axis. A clarification carries the channel it was captured through instead,
+    // which is a fact about its evidence rather than a substitute for a question.
+    const cat = el('span', 'chip', isRationale(c)
+      ? `stated · ${c.category || 'declared'}`
+      : isClarification(c)
+        ? `clarification · ${c.capture_source || 'captured'}`
+        : isEvaluation(c)
+          // The measurement's own name, and the word "model" in the chip, because
+          // the chip is the part a skimming reader reads. A row of figures with no
+          // indication of what was measured is the one thing this kind must not be.
+          ? `evaluation of ${c.evaluation_target || 'model'} · ${c.category || 'measured'}`
+          : (c.category || 'uncategorized'));
+    cat.style.color = isRationale(c) || isClarification(c) || isEvaluation(c)
+      ? 'var(--muted)'
+      : catColor(c.category || 'uncategorized');
+    top.append(cat);
+    if (isRationale(c)) {
+      // Never badge a rationale as merely "unverified". It is not a capture that
+      // failed verification; it is a record that was never meant to be one.
+      const badge = el('span', 'chip warn', 'claim · not evidence');
+      badge.title = 'An agent\'s account of its own work. Not evidence about the code.';
+      top.append(badge);
+    } else if (isBadgedUnverified(c)) {
+      const badge = el('span', 'chip warn', `${c.capture_source} · unverified`);
+      top.append(badge);
+    }
+    // Separate from the capture-source badge, not folded into it: this is a
+    // statement about the record's shape, and a record can be both inferred and
+    // delivered by the webhook. Both facts are shown rather than one winning.
+    //
+    // On the row, in the chip's own text, and not behind a hover. A reader is
+    // skimming a list; a distinction that requires hovering is a distinction most
+    // readers never see, and the reader who misses it takes the count at face
+    // value. The model is named here for the same reason the answering agent is:
+    // "inferred" alone says a guess happened, not who to ask about it.
+    if (isInferred(c)) {
+      const model = c.structure_inferred_by || 'model not named';
+      top.append(el('span', 'chip warn', `inferred · ${model}`));
+    } else if (!isAnchored(c) && !isEvaluation(c)) {
+      // A structure this page cannot read. Badged rather than treated as
+      // anchored: the write path refuses to construct one and the read path flags
+      // one, and a page that quietly resolved it to anchored would be the third
+      // place the guess is made, silently.
+      top.append(el('span', 'chip warn', `structure · ${structureOf(c)}`));
+    }
+    if (c.repo) top.append(el('span', 'chip', c.repo + (c.pr ? ` #${c.pr}` : '')));
+    if (c.jira) {
+      const chip = el('span', 'chip');
+      chip.append(document.createTextNode(c.jira));
+      top.append(chip);
+    }
+    top.append(el('span', 'when', whenLabel(c.answered_at)));
+    li.append(top);
+    const who = el('div', 'who');
+    if (isRationale(c)) {
+      const rev = c.rationale_revision ? ` · revision ${c.rationale_revision}` : '';
+      who.append(el('span', null,
+        `declared by ${c.answered_by_agent || c.author || 'unknown'}`
+        + (c.rationale_model ? ` (${c.rationale_model}, asserted)${rev}` : rev)));
+    } else if (isClarification(c)) {
+      // The account that posted the comment, the machine principal it declared,
+      // and the comment the words can be checked against. All three, because a
+      // quotation whose source cannot be re-fetched is indistinguishable from a
+      // claim — which is what a rationale is, and is not called one.
+      const parts = [`stated by ${c.author || 'unknown'}`];
+      if (c.answered_by_agent) {
+        parts.push(`authored by ${c.answered_by_agent}`);
+        if (c.clarification_model) {
+          parts.push(`(${c.clarification_model}, self-declared)`);
+        }
+      }
+      if (c.clarification_association) parts.push(c.clarification_association.toLowerCase());
+      if (c.clarification_comment_id) parts.push(`comment ${c.clarification_comment_id}`);
+      who.append(el('span', null, parts.join(' · ')));
+    } else if (isEvaluation(c)) {
+      // The model measured, and the scope the numbers are bounded by, in one line.
+      // The scope is here rather than behind a click because a measurement read
+      // without its own limits is a precision figure about a classifier, which is
+      // the claim this whole record kind exists to refuse.
+      const parts = [`measured ${c.evaluated_model || 'an unnamed model'}`];
+      if (c.evaluation_target) parts.push(`target: ${c.evaluation_target}`);
+      if (c.evaluation_scope) parts.push(c.evaluation_scope);
+      who.append(el('span', null, parts.join(' · ')));
+    } else if (c.answered_by_agent || c.author) {
+      who.append(el('span', null, `answered by ${c.answered_by_agent || c.author}`));
+    }
+    if (c.comment_author && c.comment_author !== (c.answered_by_agent || c.author)) {
+      who.append(el('span', null, `attributed to ${c.comment_author}`));
+    }
+    if (who.childNodes.length) li.append(who);
+    if (c.answer) {
+      const a = el('div', 'a');
+      a.innerHTML = inlineMd(c.answer);
+      li.append(a);
+    }
+    list.append(li);
+  }
+}
+
+function fillSelect(name, values) {
+  const select = $(`#filters select[name=${name}]`);
+  // Read before the rebuild and reapplied after, because ``replaceChildren``
+  // destroys the selected <option> and a <select> whose selected option is gone
+  // falls back to its first one. The page polls on a timer, so without this every
+  // filter a reader chose was cleared out from under them every ten seconds -- and
+  // a filter that will not stay set is not a filter. It also silently erased the
+  // count of records the structure filter had excluded, which is the one thing
+  // that count exists to make visible.
+  const chosen = select.value;
+  const first = select.options[0];
+  select.replaceChildren(first);
+  for (const v of values) {
+    const o = el('option', null, v);
+    o.value = v;
+    select.append(o);
+  }
+  // Restored only if the new data still offers it. A value that has gone from the
+  // store must not be reinstated: its option is gone, and a filter left pointing
+  // at nothing is the same "reads as absence" failure in a different place.
+  select.value = (chosen === '' || values.includes(chosen)) ? chosen : '';
+}
+
+function render(data) {
+  const { captures, meta } = data;
+  CAPTURES = captures;
+
+  const parts = [];
+  if (meta.collection) parts.push(`collection ${meta.collection}`);
+  if (meta.tanseki_url) parts.push(meta.tanseki_url);
+  if (meta.generated_at) parts.push(`snapshot ${whenLabel(meta.generated_at)}Z`);
+  if (meta.truncated) parts.push(`truncated (${meta.captured}/${meta.total} exported)`);
+  $('#meta').textContent = parts.join(' · ') || `${captures.length} captures`;
+
+  renderKpis(captures);
+  renderTimeline(captures);
+  // Every panel below this line charts captures. A measurement is never one, so the
+  // list is narrowed once here rather than at each call site: a delivery tally that
+  // included an evaluation would show an `asserted` bar that no webhook produced.
+  const realCaptures = captures.filter((c) => !isEvaluation(c));
+  // Records that actually carry a source. A question, a rationale and an observation
+  // have none, and filing them under a bar called "unknown" asserts that the store
+  // lost track of something it was never given -- a different claim, and the one a
+  // reader filtering by provenance would act on. The other panels below still want
+  // every record that is not a measurement, so this is a narrower list, not a rename.
+  const sourced = realCaptures.filter((c) => c.capture_source);
+  renderBars($('#by-source'), tally(sourced, (c) => c.capture_source),
+    { colorFor: (k) => (k === 'webhook' ? 'var(--ok)' : 'var(--bad)') });
+  // Counts answers to questions somebody was on record as being asked, and nothing
+  // else. The panel is titled "Answered by", so its bar totals are read as a count
+  // of answers; an inferred pairing in that total would make a model-matched record
+  // indistinguishable from a conversation, which is the one reading the structure
+  // axis exists to prevent. Excluded rather than folded in, and named below.
+  const answeredRecords = captures.filter(isAskedQuestion);
+  renderBars($('#by-agent'), tally(answeredRecords, (c) => c.answered_by_agent || c.author || 'unknown'),
+    { colorFor: (k) => (k === 'unknown' ? 'var(--muted)' : catColor(k)) });
+  renderBars($('#by-human'), tally(realCaptures, (c) => c.comment_author || 'unattributed'));
+  // Categories count captures only; a rationale's `category` is its source and a
+  // clarification has none at all, and mixing either in would put "declared" or an
+  // empty "uncategorized" row on a question axis.
+  renderBars($('#by-category'),
+    tally(captures.filter(hasCategory), (c) => c.category || 'uncategorized'),
+    { colorFor: catColor });
+
+  const unverified = captures.filter(isBadgedUnverified).length;
+  const rationales = captures.filter(isRationale).length;
+  const inferred = captures.filter(isInferred).length;
+  const clarifications = captures.filter(isClarification).length;
+  // A structure this build cannot read. Counted apart from inferred on purpose:
+  // "inferred" is a fact the writer asserted about its own record, while an
+  // unreadable value is a fact about the record this page cannot interpret. Folding
+  // the second into the first would report a store problem as a reader's caution.
+  // An evaluation carries no structure at all and reports `unknown`, because a
+  // measurement has no pairing to have established or inferred. Counting it here
+  // would report a store that cannot read its own records, which is the opposite
+  // of what an absent pairing means.
+  const unreadable = captures.filter((c) => !isAnchored(c) && !isInferred(c)
+    && !isEvaluation(c)).length;
+  // The "not from the webhook" counts are two different facts and are reported as
+  // two. ``notWebhook`` is every record that did not arrive as a signed delivery;
+  // ``asserted`` is the subset of those that claims no capture at all, so nothing
+  // vouched for it. The remainder reached the store by reading the provider's API,
+  // and its anchor is a comment id anyone can re-fetch. Folding that remainder in
+  // with the asserted ones is how a collected comment ends up described as
+  // unverified, which is the mirror error of never badge-ing it.
+  const notWebhook = captures.filter((c) => c.kind !== 'rationale' && !isEvaluation(c)
+    && isUnverified(c)).length;
+  const asserted = captures.filter((c) => c.kind !== 'rationale' && !isEvaluation(c)
+    && c.capture_source === 'asserted').length;
+  const collected = notWebhook - asserted;
+  // Named `note`, not `parts`: `parts` is already declared in this same function
+  // for the meta line, and a second `const parts` is a parse error that kills the
+  // whole script -- the page then renders empty with no indication why.
+  const note = [];
+  if (asserted) {
+    note.push(`${asserted} asserted, not captured — nobody vouched for them.`);
+  }
+  if (collected) {
+    note.push(`${collected} collected from the provider API rather than the webhook — `
+      + 'a comment id, not a delivery id, is the anchor.');
+  }
+  if (!notWebhook) note.push('All captures delivered by the webhook.');
+  if (inferred) {
+    note.push(`${inferred} pairing${inferred === 1 ? '' : 's'} inferred by a model — the text is `
+      + 'captured, but nobody is on record as having asked the question.');
+  }
+  if (rationales) {
+    note.push(`${rationales} stated rationales — an agent's account of its own work, `
+      + 'not evidence about the code.');
+  }
+  if (clarifications) {
+    note.push(`${clarifications} clarifications — statements nobody asked for, `
+      + 'quoted from a comment you can re-fetch.');
+  }
+  $('#source-note').textContent = note.join(' ');
+
+  // The KPI row's exclusions, stated where the numbers are. A reader who takes
+  // "asked & answered: 12" at face value has to be able to see, without leaving the
+  // row, that 3 pairings in the store were matched by a model and are therefore
+  // not in the 12. Without this the honest count and the flattering one are the
+  // same shape, and the flattering one is what gets quoted.
+  const kpiNote = [];
+  if (inferred) {
+    kpiNote.push(`${inferred} inferred pairing${inferred === 1 ? '' : 's'} `
+      + `${inferred === 1 ? 'is' : 'are'} not in "asked & answered": a model matched `
+      + 'those two sides, so nobody is on record as having asked.');
+  }
+  if (unreadable) {
+    kpiNote.push(`${unreadable} record${unreadable === 1 ? '' : 's'} `
+      + `${unreadable === 1 ? 'states' : 'state'} a structure this build cannot read, `
+      + `${unreadable === 1 ? 'is' : 'are'} not counted as answered.`);
+  }
+  $('#kpi-note').textContent = kpiNote.join(' ');
+
+  // Same rule for the "Answered by" panel, whose bar totals are read as a count of
+  // answers. Named rather than absorbed, so the panel cannot quietly become a
+  // different metric from the one its title promises.
+  const notAnswered = captures.length - answeredRecords.length;
+  $('#by-agent-note').textContent = notAnswered
+    ? `Agent that drafted the answer to a question somebody was asked. `
+      + `${notAnswered} record${notAnswered === 1 ? '' : 's'} excluded: rationales, `
+      + 'clarifications and measurements answer no question, and an inferred pairing '
+      + 'was matched by a model.'
+    : 'Agent that drafted the answer to a question somebody was asked.';
+
+  fillSelect('category',
+    tally(captures.filter(hasCategory), (c) => c.category || 'uncategorized')
+      .map(([k]) => k));
+  fillSelect('source', tally(captures, (c) => c.capture_source).map(([k]) => k));
+  fillSelect('human', tally(captures, (c) => c.comment_author || 'unattributed').map(([k]) => k));
+  fillSelect('agent', tally(captures, (c) => c.answered_by_agent || c.author || 'unknown').map(([k]) => k));
+  // The structure options are the store's own values, reported as it has them. A
+  // fixed list of `anchored`/`inferred` would leave a record in an unrecognised
+  // structure unfilterable, which is the same "label nobody can filter on" gap the
+  // axis review warns about — a decoration rather than a control.
+  fillSelect('structure', tally(captures, structureOf).map(([k]) => k));
+  // The kind options are the store's own values, for the same reason the structure
+  // options are: a fixed list would leave a kind this build does not recognise
+  // unfilterable, which is the "label nobody can filter on" gap in its other form.
+  // An unaccounted kind therefore stays reachable rather than disappearing into a
+  // total it is not in.
+  fillSelect('kind', tally(captures, kindOf).map(([k]) => k));
+  renderCaptures();
+}
+
+function load(text, source) {
+  try {
+    render(normalize(JSON.parse(text)));
+    setSourceStatus(`showing ${source}`);
+  } catch (err) {
+    setSourceStatus(`could not read ${source}: ${err.message}`);
+  }
+}
+
+function setSourceStatus(text) {
+  const node = $('#source-status');
+  node.textContent = text;
+  node.className = /could not|error|failed/i.test(text) ? 'bad' : 'empty';
+}
+
+function baseUrl() {
+  const typed = ($('#source').base.value || '').trim().replace(/\/+$/, '');
+  if (typed) return typed;
+  // Opened straight from disk there is no console origin to be relative to.
+  return location.protocol === 'file:' ? 'http://127.0.0.1:8090' : '';
+}
+
+let timer = null;
+
+async function refresh() {
+  const base = baseUrl();
+  // No limit parameter: the endpoint's default already sits at Tanseki's own
+  // listing cap, and asking for more is a 400.
+  const url = `${base}/api/knowledge`;
+  setSourceStatus('loading…');
+  try {
+    const res = await fetch(url, { cache: 'no-store' });
+    const body = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
+    if (!res.ok || body.error) {
+      setSourceStatus(`${base || location.origin} — ${body.error || `HTTP ${res.status}`}`);
+      return;
+    }
+    render(normalize(body));
+    setSourceStatus(
+      `live from ${base || location.origin} · refreshed ${new Date().toLocaleTimeString()}`
+      + ` · ${body.captured} of ${body.total}${body.truncated ? ' (capped)' : ''}`
+    );
+  } catch (err) {
+    setSourceStatus(`cannot reach ${base || location.origin} — ${err.message}`);
+  }
+}
+
+function scheduleAutoRefresh() {
+  if (timer) clearInterval(timer);
+  const every = Number($('#source').every.value) || 0;
+  if (every > 0) timer = setInterval(refresh, every * 1000);
+}
+
+$('#filters').addEventListener('input', renderCaptures);
+$('#source').addEventListener('submit', (ev) => {
+  ev.preventDefault();
+  scheduleAutoRefresh();
+  refresh();
+});
+$('#source').every.addEventListener('change', () => { scheduleAutoRefresh(); refresh(); });
+$('#source').base.addEventListener('change', refresh);
+$('#file').addEventListener('change', (ev) => {
+  const file = ev.target.files[0];
+  if (file) file.text().then((text) => load(text, file.name));
+});
+const drop = $('#drop');
+for (const type of ['dragover', 'dragenter']) {
+  drop.addEventListener(type, (ev) => { ev.preventDefault(); drop.classList.add('hot'); });
+}
+for (const type of ['dragleave', 'drop']) {
+  drop.addEventListener(type, (ev) => { ev.preventDefault(); drop.classList.remove('hot'); });
+}
+drop.addEventListener('drop', (ev) => {
+  const file = ev.dataTransfer?.files[0];
+  if (file) file.text().then((text) => load(text, file.name));
+});
+
+$('#source').base.value = baseUrl();
+scheduleAutoRefresh();
+refresh();
+
+</script>
+</body>
+</html>
