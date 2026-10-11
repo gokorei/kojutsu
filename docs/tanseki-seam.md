@@ -534,14 +534,29 @@ where a human was asked and answered, with no way to prefer the honest one.
 
 ## Edge derivation
 
-`repo`, `pr`, `jira` and `files` are the keys Tanseki's `EdgeDeriver` recognises
-(`EdgeDeriver.kt` iterates exactly those four), so edges are derived
+`repo`, `pr`, `jira` and `files` are the *source keys* Tanseki's `EdgeDeriver`
+recognises (`EdgeDeriver.kt` iterates exactly those four), so edges are derived
 **server-side** from frontmatter and resolved `[[wikilinks]]`; Kojutsu does not
-write edges. `files` resolves each path against a document that already exists, so
-a `files` edge stays dangling until something writes documents for those paths —
-the same position `repo`, `pr` and `jira` are in today. The frontmatter value is
-useful without the edge; the edge is what a future producer would light up for
-free.
+write edges. Keys are not relationship types: a traversal asks for one of the
+four `TraverseRel` values — `links-to` (body `[[wikilinks]]`), `references`
+(frontmatter `repo`/`pr`/`jira`), `embeds` (frontmatter `files`), `mentions`
+(frontmatter `author`, to a synthetic `author/<name>` id) — and a traversal that
+passes a frontmatter key (`rel: "repo"`) is answered `400` naming the four valid
+values, never an empty list.
+
+Every value resolves against a document that already exists. `files` resolves
+each path that way, so a `files` edge stays dangling until something writes
+documents for those paths — and `repo`, `pr` and `jira` resolve the same way
+(Tanseki decision (b), `docs/document-schema.md` in the Tanseki repo): a value
+that names no document derives no edge at all. A dangling value is therefore
+absent from the graph, indistinguishable from "no documents yet" by traversing,
+and the frontmatter value is useful without the edge regardless. Sibling
+discovery ("the other documents from this repo/PR") is a frontmatter filter
+(`fm=repo=...`), not a traversal: traversing `references` reaches only the
+resolved document, never the other carriers of the value. When the named
+document is written afterwards, indexing it repairs the referrers and the edge
+lights up anyway, because edges are rebuilt from documents rather than computed
+once at write time.
 
 `files` is stored as a list, bounded at `MAX_FRONTMATTER_FILES` and **saying so when
 it truncates**, because a list quietly shortened reads as a complete description of
@@ -595,7 +610,7 @@ registry does not yet record it.
 | `POST /v1/documents:upsert` | `{collection, id, path, content, frontmatter, author, message}` + `Idempotency-Key` header | `{revision, created}`, or 409 on conflict |
 | `POST /v1/documents:delete` | `{id, collection, message, author}` | `{revision}`, or 404 |
 | `GET /v1/search` | `?q=&limit=&collection=` + repeatable `&tags=` and `&fm=key=value` | `{hits: [{id, score, snippet}], total}` |
-| `POST /v1/documents:traverse` | `{id, rel, depth, collection}` | `{ids: [...]}`, or 404 |
+| `POST /v1/documents:traverse` | `{id, rel, depth, collection}` where `rel` is one of `links-to`, `references`, `embeds`, `mentions` | `{ids: [...]}`, `400` on a frontmatter key, or 404 |
 
 ## Guarantees Kojutsu relies on
 
