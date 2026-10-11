@@ -267,19 +267,41 @@ def test_listing_total_and_ids_describe_the_collection(
 
 @requires_daemon
 def test_edges_are_derived_from_shared_frontmatter(daemon: TansekiClient, tmp_path: Path) -> None:
-    """``repo``, ``pr`` and ``jira`` become edges the store derived, not ones sent.
+    """``references`` edges resolve shared ``repo``/``pr``/``jira`` values to a document.
 
     Kojutsu writes no edges, and that is only safe if the store derives them.
-    That is a claim about the two sides agreeing on which frontmatter keys mean an
-    edge, and it is the one thing the fake cannot make at all: it has no deriver to
-    disagree with.
+    The derivation is resolving, not synthetic (Tanseki decision (b) in
+    ``docs/document-schema.md`` of the Tanseki repo): a ``repo``/``pr``/``jira``
+    value that names no document derives no edge at all, so a traversal that
+    reached a *sibling* would be reading a placeholder that was never stored.
+    Three consequences, each pinned here:
+
+    - While the shared values dangle, traversing ``references`` from any of the
+      documents answers ``[]`` — dangling is absent from the graph, never a
+      visible placeholder.
+    - Siblings are never traversal-reachable, not even after the values
+      resolve: the edge points at the resolved document, not at the other
+      carriers. Finding "the other documents from this repo" is a frontmatter
+      filter (``fm=repo=...``), asserted below — not a traversal.
+    - When the named document is written afterwards, indexing it repairs the
+      referrers and the edge lights up. That is the same repair
+      ``test_files_edge_resolves_against_a_document_written_afterwards`` pins
+      for ``embeds``.
     """
-    shared = make_entry("edge-a", repo="org/shared", pr_number=7, jira_ticket_key="ABC-1")
-    sibling = make_entry("edge-b", repo="org/shared", pr_number=7, jira_ticket_key="ABC-1")
-    # Differs from ``sibling`` in exactly one key, so an empty jira traversal here is
-    # a statement about the key rather than about the store being empty.
-    no_jira = make_entry("edge-c", repo="org/shared", pr_number=7)
-    stranger = make_entry("edge-d", repo="org/other", pr_number=9, jira_ticket_key="ABC-2")
+    probe = "sharedfrontmatterprobe"
+    answer = f"{probe} is a token every edge document carries verbatim."
+    shared = make_entry(
+        "edge-a", repo="org/shared", pr_number=7, jira_ticket_key="ABC-1", answer=answer
+    )
+    sibling = make_entry(
+        "edge-b", repo="org/shared", pr_number=7, jira_ticket_key="ABC-1", answer=answer
+    )
+    # Differs from ``sibling`` in exactly one key, so a jira filter that drops
+    # it is a statement about the key rather than about the store being empty.
+    no_jira = make_entry("edge-c", repo="org/shared", pr_number=7, answer=answer)
+    stranger = make_entry(
+        "edge-d", repo="org/other", pr_number=9, jira_ticket_key="ABC-2", answer=answer
+    )
     store(daemon, tmp_path / "outbox.db", shared, sibling, no_jira, stranger)
 
     shared_id = document_id(shared)
@@ -287,19 +309,51 @@ def test_edges_are_derived_from_shared_frontmatter(daemon: TansekiClient, tmp_pa
     no_jira_id = document_id(no_jira)
     stranger_id = document_id(stranger)
 
-    for relation in ("repo", "pr"):
-        _assert_eventually(
-            lambda rel=relation: sibling_id in daemon.traverse(shared_id, rel),
-            f"traversing {relation} from {shared_id} reaches {sibling_id}",
-        )
-        assert stranger_id not in daemon.traverse(shared_id, relation)
+    # Dangling references are absent from the graph: every shared value names
+    # no document yet, so there is nothing to traverse to.
+    for doc_id in (shared_id, sibling_id, no_jira_id, stranger_id):
+        assert daemon.traverse(doc_id, "references") == []
+
+    # Sibling discovery is a frontmatter filter, not a traversal. The query
+    # alone matches all four documents; only the filter narrows.
+    def repo_siblings() -> set[str]:
+        return {
+            hit.id
+            for hit in daemon.search(probe, frontmatter={"repo": "org/shared"}, limit=10)
+        }
 
     _assert_eventually(
-        lambda: sibling_id in daemon.traverse(shared_id, "jira"),
-        f"traversing jira from {shared_id} reaches {sibling_id}",
+        lambda: repo_siblings() == {shared_id, sibling_id, no_jira_id},
+        "the repo filter lists the three documents carrying org/shared",
     )
-    assert no_jira_id not in daemon.traverse(shared_id, "jira")
-    assert daemon.traverse(no_jira_id, "jira") == []
+    assert {
+        hit.id for hit in daemon.search(probe, frontmatter={"jira": "ABC-1"}, limit=10)
+    } == {shared_id, sibling_id}
+
+    # The repository note the ``repo`` value names arrives afterwards. Indexing
+    # it repairs every referrer whose derivation can now resolve: written
+    # directly, because Kojutsu's sink derives every id from an entry and can
+    # never mint the bare ``org/shared`` id a ``repo`` value resolves to.
+    daemon.upsert_document(
+        {
+            "id": "org/shared",
+            "path": "org/shared.md",
+            "content": '---\ntitle: "shared repo note"\n---\n# shared repo note\n',
+            "frontmatter": {"title": "shared repo note"},
+            "author": "e2e",
+            "message": "e2e repository note",
+        }
+    )
+    _assert_eventually(
+        lambda: "org/shared" in daemon.traverse(shared_id, "references"),
+        f"traversing references from {shared_id} reaches the org/shared note",
+    )
+    assert "org/shared" in daemon.traverse(sibling_id, "references")
+    assert "org/shared" in daemon.traverse(no_jira_id, "references")
+    # The edge points at the resolved document, never at a sibling ...
+    assert sibling_id not in daemon.traverse(shared_id, "references")
+    # ... and a value that still names nothing still derives nothing.
+    assert daemon.traverse(stranger_id, "references") == []
 
 
 @requires_daemon
@@ -314,19 +368,25 @@ def test_files_edge_resolves_against_a_document_written_afterwards(
     rebuilt from documents rather than computed once at write time.
     """
     target = make_entry("files-target", repo="org/files", pr_number=3)
-    store(daemon, tmp_path / "outbox.db", target)
-
     referring = make_entry(
         "files-source",
         repo="org/files",
         pr_number=4,
         files=[document_path(target)],
     )
+    # The reference is written first and the target arrives afterwards, so the
+    # ``embeds`` edge has to light up by repair rather than at write time.
     store(daemon, tmp_path / "outbox.db", referring)
+    referring_id = document_id(referring)
+
+    # Dangling first: the path names no document yet, so there is no edge.
+    assert daemon.traverse(referring_id, "embeds") == []
+
+    store(daemon, tmp_path / "outbox.db", target)
 
     _assert_eventually(
-        lambda: document_id(target) in daemon.traverse(document_id(referring), "files"),
-        f"the files edge from {document_id(referring)} reaches {document_id(target)}",
+        lambda: document_id(target) in daemon.traverse(referring_id, "embeds"),
+        f"the embeds edge from {referring_id} reaches {document_id(target)}",
     )
 
 
@@ -384,7 +444,7 @@ def test_absent_documents_answer_not_found(daemon: TansekiClient) -> None:
     absent = "org/repo/pr-0/never-written"
     assert daemon.get_document(absent) is None
     assert daemon.delete_document(absent, message="e2e", author="e2e") is False
-    assert daemon.traverse(absent, "pr") == []
+    assert daemon.traverse(absent, "references") == []
 
 
 @requires_daemon
