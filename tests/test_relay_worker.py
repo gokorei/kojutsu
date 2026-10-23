@@ -43,15 +43,13 @@ def test_shutdown_waits_for_tasks_created_during_drain() -> None:
         try:
             task_a = asyncio.create_task(event_a.wait())
             tracked.append(task_a)
-            relay_worker._active_relay_tasks.add(task_a)
-            task_a.add_done_callback(relay_worker._active_relay_tasks.discard)
+            relay_worker.track_relay_task(task_a)
             waiter = asyncio.create_task(relay_worker.wait_for_relay_shutdown(timeout_seconds=5.0))
             await asyncio.sleep(0.05)
             assert not waiter.done()
             task_b = asyncio.create_task(event_b.wait())
             tracked.append(task_b)
-            relay_worker._active_relay_tasks.add(task_b)
-            task_b.add_done_callback(relay_worker._active_relay_tasks.discard)
+            relay_worker.track_relay_task(task_b)
             event_a.set()
             await asyncio.sleep(0.05)
             assert not waiter.done(), "drain must cover tasks created during the drain"
@@ -65,7 +63,7 @@ def test_shutdown_waits_for_tasks_created_during_drain() -> None:
             await asyncio.gather(*tracked, return_exceptions=True)
 
     asyncio.run(main())
-    assert not relay_worker._active_relay_tasks
+    assert relay_worker.relay_tasks_pending() == 0
 
 
 def test_relay_loop_counts_unexpected_failures(monkeypatch) -> None:

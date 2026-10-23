@@ -12,6 +12,7 @@ import threading
 from contextlib import suppress
 from dataclasses import dataclass, field
 from time import monotonic
+from types import TracebackType
 from typing import Any
 
 from kojutsu.config import Settings, get_settings
@@ -232,7 +233,12 @@ class Runtime:
     def __enter__(self) -> Runtime:
         return self
 
-    def __exit__(self, *exc: object) -> None:
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
         self.close()
 
 
@@ -277,28 +283,66 @@ def build_runtime(settings: Settings | None = None) -> Runtime:
         return runtime
 
 
-_runtime: Runtime | None = None
-_runtime_lock = threading.RLock()
+class _RuntimeHolder:
+    """Owns the process-wide runtime: built once, closed on reset.
+
+    Every mutation goes through this type under its lock, so the only
+    module state is one instance rather than a bare global plus a bare
+    lock that every reader must remember to pair correctly.
+    """
+
+    def __init__(self) -> None:
+        self._held: Runtime | None = None
+        self._lock = threading.RLock()
+
+    def get(self) -> Runtime:
+        """Return the process-wide runtime, building it on first use."""
+        with self._lock:
+            if self._held is None:
+                self._held = build_runtime()
+            return self._held
+
+    def install(self, runtime: Runtime | None) -> Runtime | None:
+        """Install ``runtime`` (``None`` clears), returning the previous one.
+
+        The documented seam for tests and shutdown handover: it swaps the
+        reference without closing anything, so ownership of the previous
+        value -- close it, or hand it to per-resource cleanup -- stays with
+        the caller. :func:`reset_runtime` is the closing variant.
+        """
+        with self._lock:
+            previous, self._held = self._held, runtime
+            return previous
+
+    def reset(self) -> None:
+        """Close and clear the cached runtime (used by tests and shutdown)."""
+        with self._lock:
+            runtime = self._held
+            self._held = None
+            if runtime is not None:
+                try:
+                    runtime.close()
+                except TimeoutError:
+                    self._held = runtime
+                    raise
+
+
+_holder = _RuntimeHolder()
 
 
 def get_runtime() -> Runtime:
     """Return the process-wide runtime, building it on first use."""
-    global _runtime
-    with _runtime_lock:
-        if _runtime is None:
-            _runtime = build_runtime()
-        return _runtime
+    return _holder.get()
+
+
+def install_runtime(runtime: Runtime | None) -> Runtime | None:
+    """Install ``runtime`` (``None`` clears), returning the previous one.
+
+    Test and shutdown seam; see :meth:`_RuntimeHolder.install`.
+    """
+    return _holder.install(runtime)
 
 
 def reset_runtime() -> None:
     """Close and clear the cached runtime (used by tests and shutdown)."""
-    global _runtime
-    with _runtime_lock:
-        runtime = _runtime
-        _runtime = None
-        if runtime is not None:
-            try:
-                runtime.close()
-            except TimeoutError:
-                _runtime = runtime
-                raise
+    _holder.reset()

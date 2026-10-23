@@ -153,6 +153,78 @@ def _build(
     )
 
 
+def _require_worker_start(*, policy: str, capture_only: bool) -> None:
+    """Refuse a start whose policy or cycle shape cannot do the job."""
+    if policy not in GATE_POLICIES:
+        typer.echo(f"--gates must be one of {', '.join(sorted(GATE_POLICIES))}.", err=True)
+        raise typer.Exit(1)
+    if not capture_only:
+        typer.echo(
+            "Refusing to start: the full cycle has no implementer. Pass --capture-only, "
+            "which reviews pull requests other people wrote.",
+            err=True,
+        )
+        raise typer.Exit(1)
+
+
+def _announce_worker(
+    worker: Worker, *, repo: str, apply: bool, poll_interval: float, policy: str
+) -> None:
+    """Recover orphaned claims and print what this worker will do."""
+    released = worker.release_orphans()
+    if released:
+        typer.echo(f"Recovered {len(released)} orphaned claim(s): {', '.join(released)}")
+
+    status = worker.status()
+    typer.echo(
+        f"Worker '{status['worker']}' on {repo} | steps: {', '.join(status['steps'])} | "
+        f"{'posting' if apply else 'plan only'} | every {poll_interval:g}s"
+    )
+    if status["capture_only"]:
+        typer.echo("Capture-only: this worker reviews pull requests, it does not write code.")
+    if policy == "record":
+        # Said out loud every start, because this is the one setting that relaxes a
+        # default block, and a demo that quietly stopped requiring approval would be
+        # the least honest thing this worker could do.
+        typer.echo(
+            "Gates: 'record' — the plan-approval gate is evaluated and its decision "
+            "written, but it does not block. Use --gates enforce to require it."
+        )
+
+
+def _serve_worker_forever(worker: Worker, *, cycles: int | None) -> None:
+    """Poll until stopped, then release the forge connection."""
+    stop = threading.Event()
+
+    def _handle(signum: int, _frame: object) -> None:
+        stop.set()
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, _handle)
+
+    def _on_report(report: object) -> None:
+        summary = getattr(report, "summary", str(report))
+        typer.echo(f"  {summary}")
+
+    typer.echo("Polling. Ctrl-C to stop.")
+    try:
+        worker.run_forever(
+            cycles=cycles,
+            sleep=stop.wait,
+            on_report=_on_report,
+        )
+    finally:
+        # Stop the timer regardless of how the loop ended, so a Ctrl-C that lands
+        # during a long poll is not followed by a full interval of silence.
+        stop.set()
+        # Then hand back the forge connection. In this order and not the reverse:
+        # the client is closed after the loop that uses it has stopped, never at
+        # the point it was built, which would end the worker's ability to read on
+        # its first poll.
+        worker.close()
+        typer.echo("Worker stopped.")
+
+
 @app.command()
 def run(
     repo: str = typer.Option(DEFAULT_REPO, "--repo", help="owner/name to review."),
@@ -182,16 +254,7 @@ def run(
     """Poll for open pull requests and capture knowledge from each one."""
     settings = get_settings()
     _require(settings)
-    if policy not in GATE_POLICIES:
-        typer.echo(f"--gates must be one of {', '.join(sorted(GATE_POLICIES))}.", err=True)
-        raise typer.Exit(1)
-    if not capture_only:
-        typer.echo(
-            "Refusing to start: the full cycle has no implementer. Pass --capture-only, "
-            "which reviews pull requests other people wrote.",
-            err=True,
-        )
-        raise typer.Exit(1)
+    _require_worker_start(policy=policy, capture_only=capture_only)
 
     state_dir = _state_dir(settings)
     worker = _build(
@@ -206,55 +269,8 @@ def run(
         policy=policy,
     )
 
-    released = worker.release_orphans()
-    if released:
-        typer.echo(f"Recovered {len(released)} orphaned claim(s): {', '.join(released)}")
-
-    status = worker.status()
-    typer.echo(
-        f"Worker '{status['worker']}' on {repo} | steps: {', '.join(status['steps'])} | "
-        f"{'posting' if apply else 'plan only'} | every {poll_interval:g}s"
-    )
-    if status["capture_only"]:
-        typer.echo("Capture-only: this worker reviews pull requests, it does not write code.")
-    if policy == "record":
-        # Said out loud every start, because this is the one setting that relaxes a
-        # default block, and a demo that quietly stopped requiring approval would be
-        # the least honest thing this worker could do.
-        typer.echo(
-            "Gates: 'record' — the plan-approval gate is evaluated and its decision "
-            "written, but it does not block. Use --gates enforce to require it."
-        )
-
-    stop = threading.Event()
-
-    def _handle(signum: int, _frame: object) -> None:
-        stop.set()
-
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        signal.signal(sig, _handle)
-
-    def _on_report(report: object) -> None:
-        summary = getattr(report, "summary", str(report))
-        typer.echo(f"  {summary}")
-
-    typer.echo("Polling. Ctrl-C to stop.")
-    try:
-        worker.run_forever(
-            cycles=cycles,
-            sleep=stop.wait,  # type: ignore[arg-type]
-            on_report=_on_report,
-        )
-    finally:
-        # Stop the timer regardless of how the loop ended, so a Ctrl-C that lands
-        # during a long poll is not followed by a full interval of silence.
-        stop.set()
-        # Then hand back the forge connection. In this order and not the reverse:
-        # the client is closed after the loop that uses it has stopped, never at
-        # the point it was built, which would end the worker's ability to read on
-        # its first poll.
-        worker.close()
-        typer.echo("Worker stopped.")
+    _announce_worker(worker, repo=repo, apply=apply, poll_interval=poll_interval, policy=policy)
+    _serve_worker_forever(worker, cycles=cycles)
 
 
 @app.command()

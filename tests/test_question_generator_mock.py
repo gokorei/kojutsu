@@ -12,6 +12,7 @@ from kojutsu.core import question_generator
 from kojutsu.integrations.github_models import GitHubPullRequest
 from kojutsu.integrations.jira_client import JiraUnavailableError
 from kojutsu.integrations.llm import (
+    ChapteredQuestion,
     LLMConfig,
     LLMConfigurationError,
     LLMProviderError,
@@ -50,10 +51,15 @@ def test_generate_questions_builds_context_and_questions(monkeypatch) -> None:
     monkeypatch.setattr(question_generator, "GitHubClient", FakeGitHubClient)
 
     def generate_questions(prompt, provider, model, api_key, **kwargs):
+        captured["prompt"] = prompt
         captured.update(kwargs)
-        return [(QuestionCategory.DESIGN_DECISION, "Why?")]
+        return [
+            ChapteredQuestion(
+                chapter_id="c1", category=QuestionCategory.DESIGN_DECISION, text="Why?"
+            )
+        ]
 
-    monkeypatch.setattr(question_generator, "generate_questions_sync", generate_questions)
+    monkeypatch.setattr(question_generator, "generate_chaptered_questions_sync", generate_questions)
 
     questions, context = question_generator.generate_questions_for_pr(
         "org/repo#1",
@@ -87,6 +93,11 @@ def test_generate_questions_builds_context_and_questions(monkeypatch) -> None:
         "pr_number": 1,
         "jira_ticket_key": "ABC-1",
     }
+    # The prologue and the chapter map reach the prompt rather than being fetched
+    # and discarded. The PR title was previously used only to regex a Jira key.
+    assert "Add feature" in captured["prompt"]
+    assert "## Chapter c1" in captured["prompt"]
+    assert captured["chapter_ids"] == ["c1"]
 
 
 def test_generate_questions_publishes_no_anchor_when_the_head_omits_one(monkeypatch) -> None:
@@ -109,8 +120,12 @@ def test_generate_questions_publishes_no_anchor_when_the_head_omits_one(monkeypa
     monkeypatch.setattr(question_generator, "GitHubClient", HeadWithoutSha)
     monkeypatch.setattr(
         question_generator,
-        "generate_questions_sync",
-        lambda *_a, **_k: [(QuestionCategory.DESIGN_DECISION, "Why?")],
+        "generate_chaptered_questions_sync",
+        lambda *_a, **_k: [
+            ChapteredQuestion(
+                chapter_id="c1", category=QuestionCategory.DESIGN_DECISION, text="Why?"
+            )
+        ],
     )
 
     questions, context = question_generator.generate_questions_for_pr(
@@ -140,8 +155,12 @@ def test_jira_enrichment_failure_warns_and_falls_back(monkeypatch, caplog) -> No
     monkeypatch.setattr(question_generator, "JiraClient", FailingJiraClient)
     monkeypatch.setattr(
         question_generator,
-        "generate_questions_sync",
-        lambda *_args, **_kwargs: [(QuestionCategory.DESIGN_DECISION, "Why?")],
+        "generate_chaptered_questions_sync",
+        lambda *_args, **_kwargs: [
+            ChapteredQuestion(
+                chapter_id="c1", category=QuestionCategory.DESIGN_DECISION, text="Why?"
+            )
+        ],
     )
 
     with caplog.at_level("WARNING"):
@@ -329,8 +348,12 @@ def test_question_generator_preflight_receives_configured_ollama_base_url(monkey
     monkeypatch.setattr(question_generator, "validate_llm_privacy", privacy)
     monkeypatch.setattr(
         question_generator,
-        "generate_questions_sync",
-        lambda *_args, **_kwargs: [(QuestionCategory.DESIGN_DECISION, "Why?")],
+        "generate_chaptered_questions_sync",
+        lambda *_args, **_kwargs: [
+            ChapteredQuestion(
+                chapter_id="c1", category=QuestionCategory.DESIGN_DECISION, text="Why?"
+            )
+        ],
     )
 
     question_generator.generate_questions_for_pr(
@@ -540,3 +563,102 @@ def test_malformed_provider_output_is_rejected(monkeypatch) -> None:
             external_enabled=True,
             allowed_repositories="org/repo",
         )
+
+
+@pytest.mark.parametrize(
+    ("chapter_count", "max_questions", "expected"),
+    [
+        (0, 6, 1),
+        (1, 2, 2),
+        (2, 6, 2),
+        (4, 6, 1),
+        (6, 6, 1),
+    ],
+)
+def test_per_chapter_budget_spends_coverage_before_depth(
+    chapter_count: int, max_questions: int, expected: int
+) -> None:
+    assert question_generator._max_questions_per_chapter(chapter_count, max_questions) == expected
+
+
+def test_uncovered_chapter_is_reported_not_silently_covered(monkeypatch, caplog) -> None:
+    class TwoChapterClient(FakeGitHubClient):
+        def get_pull_diff(self, owner: str, repo: str, pr_number: int) -> str:
+            return (
+                "diff --git a/src/core/a.py b/src/core/a.py\n"
+                "--- a/src/core/a.py\n"
+                "+++ b/src/core/a.py\n"
+                "@@ -1 +1 @@\n"
+                "+a\n"
+                "diff --git a/tests/test_a.py b/tests/test_a.py\n"
+                "--- a/tests/test_a.py\n"
+                "+++ b/tests/test_a.py\n"
+                "@@ -1 +1 @@\n"
+                "+b\n"
+            )
+
+        def get_pr_files(self, owner: str, repo: str, pr_number: int):
+            from kojutsu.integrations.github import PagedResult
+
+            return PagedResult(items=["src/core/a.py", "tests/test_a.py"], truncated=False)
+
+    monkeypatch.setattr(question_generator, "GitHubClient", TwoChapterClient)
+    monkeypatch.setattr(
+        question_generator,
+        "generate_chaptered_questions_sync",
+        lambda *_args, **_kwargs: [
+            ChapteredQuestion(
+                chapter_id="c1", category=QuestionCategory.DESIGN_DECISION, text="Why?"
+            )
+        ],
+    )
+
+    with caplog.at_level("WARNING"):
+        question_generator.generate_questions_for_pr(
+            "org/repo#1",
+            "tok",
+            llm_provider="openai",
+            llm_api_key="k",
+            llm_external_enabled=True,
+            llm_allowed_repositories="org/repo",
+        )
+
+    assert "left 1 chapter(s) uncovered" in caplog.text
+    assert "c2 (tests)" in caplog.text
+
+
+def test_an_empty_diff_falls_back_to_the_flat_prompt(monkeypatch) -> None:
+    captured: dict[str, str] = {}
+
+    class EmptyDiffClient(FakeGitHubClient):
+        def get_pull_diff(self, owner: str, repo: str, pr_number: int) -> str:
+            return ""
+
+        def get_pr_files(self, owner: str, repo: str, pr_number: int):
+            from kojutsu.integrations.github import PagedResult
+
+            return PagedResult(items=[], truncated=False)
+
+    def flat(prompt, provider, model, api_key, **kwargs):
+        captured["prompt"] = prompt
+        return [(QuestionCategory.DESIGN_DECISION, "Why?")]
+
+    monkeypatch.setattr(question_generator, "GitHubClient", EmptyDiffClient)
+    monkeypatch.setattr(question_generator, "generate_questions_sync", flat)
+    monkeypatch.setattr(
+        question_generator,
+        "generate_chaptered_questions_sync",
+        lambda *_a, **_k: pytest.fail("chaptered path used with no chapters"),
+    )
+
+    questions, _ = question_generator.generate_questions_for_pr(
+        "org/repo#1",
+        "tok",
+        llm_provider="openai",
+        llm_api_key="k",
+        llm_external_enabled=True,
+        llm_allowed_repositories="org/repo",
+    )
+
+    assert len(questions) == 1
+    assert "## Pull request diff source data" in captured["prompt"]

@@ -675,107 +675,135 @@ def _validate_question_state(db: sqlite3.Connection) -> None:
         raise RuntimeError("Registry contains questions with no last-touched timestamp")
 
 
+#: Columns every table must carry after migration. The ``head_sha`` nullability
+#: is deliberate: a question predating v7 has no commit recorded against it,
+#: and a column that refused ``NULL`` would force one to be invented.
+_REQUIRED_COLUMNS: dict[str, set[str]] = {
+    "questions": {
+        "question_id",
+        "identifier",
+        "question_author",
+        "created_at",
+        "updated_at",
+        "answered_at",
+        "status",
+        "assignee",
+        "attempts",
+        "last_attempt_at",
+        "claimed_at",
+        "lease_expires_at",
+        "last_error",
+        "claim_token",
+        "head_sha",
+    },
+    "registry_migrations": {"version", "checksum", "applied_at"},
+    "pr_state_changes": {
+        "event_id",
+        "repo",
+        "pr_number",
+        "action",
+        "status",
+        "claim_token",
+        "completed_at",
+    },
+    "answer_captures": {
+        "answer_comment_id",
+        "parent_comment_id",
+        "question_id",
+        "entry_id",
+        "status",
+        "claimed_at",
+        "lease_expires_at",
+        "claim_token",
+        "completed_at",
+    },
+    "webhook_deliveries": {
+        "delivery_id",
+        "repo",
+        "event",
+        "payload_hash",
+        "status",
+        "claimed_at",
+        "lease_expires_at",
+        "claim_token",
+        "completed_at",
+        "created_at",
+    },
+    "sessions": {"session_id"},
+    "review_captures": {
+        "review_event_id",
+        "repo",
+        "pr_number",
+        "review_id",
+        "comment_id",
+        "kind",
+        "author",
+        "status",
+        "claimed_at",
+        "lease_expires_at",
+        "last_error",
+        "completed_at",
+        "claim_token",
+    },
+    "rationale_captures": {
+        "entry_id",
+        "repo",
+        "pr_number",
+        "branch",
+        "declared_by",
+        "declared_model",
+        "source",
+        "revision",
+        "revises",
+        "rationale_text",
+        "status",
+        "claimed_at",
+        "lease_expires_at",
+        "last_error",
+        "completed_at",
+        "claim_token",
+    },
+    "backfill_receipts": {
+        "repo",
+        "pr_number",
+        "observed_updated_at",
+        "window_since",
+        "window_until",
+        "associations",
+        "finished",
+        "recorded_at",
+    },
+}
+
+#: Indexes every table must carry. Enumeration of outstanding work must not
+#: degrade into a full table scan.
+_REQUIRED_INDEXES: dict[str, set[str]] = {
+    "answer_captures": {
+        "answer_captures_question_unique_idx",
+        "answer_captures_question_idx",
+    },
+    "pr_state_changes": {
+        "pr_state_changes_lookup_idx",
+        "pr_state_changes_status_idx",
+    },
+    "webhook_deliveries": {
+        "webhook_deliveries_status_idx",
+        "webhook_deliveries_completed_idx",
+    },
+    "questions": {"questions_work_idx"},
+    "review_captures": {
+        "review_captures_lookup_idx",
+        "review_captures_comment_unique_idx",
+    },
+    "rationale_captures": {
+        "rationale_captures_lookup_idx",
+        "rationale_captures_revision_unique_idx",
+    },
+}
+
+
 def _validate_schema(db: sqlite3.Connection) -> None:
-    required_columns = {
-        "questions": {
-            "question_id",
-            "identifier",
-            "question_author",
-            "created_at",
-            "updated_at",
-            "answered_at",
-            "status",
-            "assignee",
-            "attempts",
-            "last_attempt_at",
-            "claimed_at",
-            "lease_expires_at",
-            "last_error",
-            "claim_token",
-            # Nullable by design and by migration: a question predating v7 has no
-            # commit recorded against it, and a column that refused ``NULL`` would
-            # force one to be invented.
-            "head_sha",
-        },
-        "registry_migrations": {"version", "checksum", "applied_at"},
-        "pr_state_changes": {
-            "event_id",
-            "repo",
-            "pr_number",
-            "action",
-            "status",
-            "claim_token",
-            "completed_at",
-        },
-        "answer_captures": {
-            "answer_comment_id",
-            "parent_comment_id",
-            "question_id",
-            "entry_id",
-            "status",
-            "claimed_at",
-            "lease_expires_at",
-            "claim_token",
-            "completed_at",
-        },
-        "webhook_deliveries": {
-            "delivery_id",
-            "repo",
-            "event",
-            "payload_hash",
-            "status",
-            "claimed_at",
-            "lease_expires_at",
-            "claim_token",
-            "completed_at",
-            "created_at",
-        },
-        "sessions": {"session_id"},
-        "review_captures": {
-            "review_event_id",
-            "repo",
-            "pr_number",
-            "review_id",
-            "comment_id",
-            "kind",
-            "author",
-            "status",
-            "claimed_at",
-            "lease_expires_at",
-            "last_error",
-            "completed_at",
-            "claim_token",
-        },
-        "rationale_captures": {
-            "entry_id",
-            "repo",
-            "pr_number",
-            "branch",
-            "declared_by",
-            "declared_model",
-            "source",
-            "revision",
-            "revises",
-            "rationale_text",
-            "status",
-            "claimed_at",
-            "lease_expires_at",
-            "last_error",
-            "completed_at",
-            "claim_token",
-        },
-        "backfill_receipts": {
-            "repo",
-            "pr_number",
-            "observed_updated_at",
-            "window_since",
-            "window_until",
-            "associations",
-            "finished",
-            "recorded_at",
-        },
-    }
-    for table, required in required_columns.items():
+    for table, required in _REQUIRED_COLUMNS.items():
         if not _table_exists(db, table) or not required.issubset(_table_columns(db, table)):
             raise RuntimeError(f"Registry migration produced an invalid {table} schema")
     _validate_pr_state_changes(db)
@@ -783,34 +811,18 @@ def _validate_schema(db: sqlite3.Connection) -> None:
     _validate_question_state(db)
     if _table_exists(db, "pr_state_changes_legacy"):
         raise RuntimeError("Legacy PR state table was not removed")
-    required_indexes = {
-        "answer_captures": {
-            "answer_captures_question_unique_idx",
-            "answer_captures_question_idx",
-        },
-        "pr_state_changes": {
-            "pr_state_changes_lookup_idx",
-            "pr_state_changes_status_idx",
-        },
-        "webhook_deliveries": {
-            "webhook_deliveries_status_idx",
-            "webhook_deliveries_completed_idx",
-        },
-        # Enumeration of outstanding work must not degrade into a full table scan.
-        "questions": {"questions_work_idx"},
-        "review_captures": {
-            "review_captures_lookup_idx",
-            "review_captures_comment_unique_idx",
-        },
-        "rationale_captures": {
-            "rationale_captures_lookup_idx",
-            "rationale_captures_revision_unique_idx",
-        },
-    }
-    for table, required in required_indexes.items():
+    _validate_schema_indexes(db)
+    _validate_no_duplicate_answers(db)
+
+
+def _validate_schema_indexes(db: sqlite3.Connection) -> None:
+    for table, required in _REQUIRED_INDEXES.items():
         indexes = {str(row[1]) for row in db.execute(f"PRAGMA index_list({table})")}
         if not required.issubset(indexes):
             raise RuntimeError(f"Registry migration produced invalid indexes for {table}")
+
+
+def _validate_no_duplicate_answers(db: sqlite3.Connection) -> None:
     if db.execute(
         """
         SELECT COUNT(*)
@@ -833,6 +845,17 @@ def _migrate_schema_transaction(db: sqlite3.Connection) -> None:
     if version == SCHEMA_VERSION:
         _validate_schema(db)
         return
+    _migrate_claim_columns(db)
+    _record_migration(db, 4, _MIGRATION_V4)
+    _record_migration(db, 5, _MIGRATION_V5)
+    _record_migration(db, 6, _MIGRATION_V6)
+    _record_migration(db, 7, _MIGRATION_V7)
+    _record_migration(db, 8, _MIGRATION_V8)
+    db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+    _validate_schema(db)
+
+
+def _migrate_claim_columns(db: sqlite3.Connection) -> None:
     _ensure_columns(
         db,
         "pr_state_changes",
@@ -925,13 +948,6 @@ def _migrate_schema_transaction(db: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS webhook_deliveries_completed_idx "
         "ON webhook_deliveries (status, completed_at)"
     )
-    _record_migration(db, 4, _MIGRATION_V4)
-    _record_migration(db, 5, _MIGRATION_V5)
-    _record_migration(db, 6, _MIGRATION_V6)
-    _record_migration(db, 7, _MIGRATION_V7)
-    _record_migration(db, 8, _MIGRATION_V8)
-    db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-    _validate_schema(db)
 
 
 def _migrate_schema(db: sqlite3.Connection) -> None:

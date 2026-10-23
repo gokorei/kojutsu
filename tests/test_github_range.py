@@ -195,6 +195,9 @@ class RecordingTransport:
 
 
 def patch_http(monkeypatch: pytest.MonkeyPatch, transport: RecordingTransport) -> None:
+    from pytest_time.instant_sleep import InstantSleep
+
+    InstantSleep().install(monkeypatch)
     real_client = httpx.Client
 
     def factory(*args: Any, **kwargs: Any) -> httpx.Client:

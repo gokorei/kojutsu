@@ -28,6 +28,7 @@ import secrets
 import tempfile
 import time
 from pathlib import Path
+from types import TracebackType
 from typing import Any
 
 from kojutsu.integrations.github import GitHubClient
@@ -105,7 +106,12 @@ class OpenPullRequestSource:
     def __enter__(self) -> OpenPullRequestSource:
         return self
 
-    def __exit__(self, *exc: object) -> None:
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
         self.close()
 
     # -- durable record --------------------------------------------------------

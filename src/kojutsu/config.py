@@ -32,6 +32,7 @@ politely.
 from __future__ import annotations
 
 import os
+import threading
 import tomllib
 from contextvars import ContextVar
 from pathlib import Path
@@ -54,6 +55,7 @@ SECRET_SETTING_NAMES = frozenset(
         "github_webhook_secret",
         "jira_api_token",
         "llm_api_key",
+        "status_token",
         "tanseki_api_key",
     }
 )
@@ -498,6 +500,12 @@ class Settings(BaseSettings):
 
     dev_console_token: str = ""
 
+    # Bearer token for the authed /webhook/status endpoint. Empty means fall
+    # back to ``github_webhook_secret`` for compatibility; set it to separate
+    # HMAC signing from status reads (the webhook secret is shared with GitHub
+    # hook viewers, the status token need not be).
+    status_token: str = ""
+
     # Local SQLite registry for ingestion state (questions, dedupe, sessions).
     kojutsu_registry_path: str = "~/.kojutsu/registry.db"
     kojutsu_sqlite_workers: int = 1
@@ -538,6 +546,11 @@ class Settings(BaseSettings):
     def tanseki_enabled(self) -> bool:
         """Whether the Tanseki seam is configured."""
         return bool(self.tanseki_url.strip())
+
+    @property
+    def status_auth_token(self) -> str:
+        """Bearer token for /webhook/status: explicit token, else webhook secret."""
+        return self.status_token or self.github_webhook_secret
 
 
 #: Repository scope mapping, in one place so the three names cannot drift.
@@ -582,30 +595,63 @@ def repository_scope_map(settings: Settings) -> dict[str, list[str]]:
     }
 
 
-_settings_lock: Any = None
+class _SettingsCache:
+    """Owns the cached :func:`get_settings` instance and its invalidation key.
 
-_CachedSettings: Settings | None = None
-_CachedEnviron: dict[str, str] | None = None
-_CachedInstance: str | None = None
-_CachedConfigEnv: str | None = None
-_CachedEnvFile: str | None = None
+    The cache is keyed on the observable inputs (environment snapshot,
+    selected instance, config/env-file pointers) so tests that mutate the
+    environment still see fresh values while steady-state production code
+    constructs exactly once per process. Every read and write goes through
+    this type under its lock instead of through bare module globals.
+    """
 
-try:
-    import threading as _threading
+    def __init__(self) -> None:
+        self._settings: Settings | None = None
+        self._environ: dict[str, str] | None = None
+        self._instance: str | None = None
+        self._config_env: str | None = None
+        self._env_file: str | None = None
+        self._lock = threading.Lock()
 
-    _settings_lock = _threading.Lock()
-except Exception:  # pragma: no cover - threading is always available
-    _settings_lock = None
+    def reset(self) -> None:
+        """Clear the cached instance (tests and reselection)."""
+        with self._lock:
+            self._settings = None
+            self._environ = None
+            self._instance = None
+            self._config_env = None
+            self._env_file = None
+
+    def get(self) -> Settings:
+        """Return the process-wide :class:`Settings`, building it once."""
+        with self._lock:
+            snapshot = dict(os.environ)
+            instance = selected_instance_name()
+            config_env = os.getenv(CONFIG_ENV_VAR)
+            env_file = os.getenv("KOJUTSU_ENV_FILE")
+            if (
+                self._settings is not None
+                and self._environ == snapshot
+                and self._instance == instance
+                and self._config_env == config_env
+                and self._env_file == env_file
+            ):
+                return self._settings
+            settings = Settings()
+            self._settings = settings
+            self._environ = snapshot
+            self._instance = instance
+            self._config_env = config_env
+            self._env_file = env_file
+            return settings
+
+
+_cache = _SettingsCache()
 
 
 def reset_settings_cache() -> None:
     """Clear the cached :func:`get_settings` instance (tests and reselection)."""
-    global _CachedSettings, _CachedEnviron, _CachedInstance, _CachedConfigEnv, _CachedEnvFile
-    _CachedSettings = None
-    _CachedEnviron = None
-    _CachedInstance = None
-    _CachedConfigEnv = None
-    _CachedEnvFile = None
+    _cache.reset()
 
 
 def get_settings() -> Settings:
@@ -616,30 +662,4 @@ def get_settings() -> Settings:
     mutate the environment via ``monkeypatch`` still see fresh values while
     steady-state production code constructs exactly once per process.
     """
-    global _CachedSettings, _CachedEnviron, _CachedInstance, _CachedConfigEnv, _CachedEnvFile
-    lock = _settings_lock
-    if lock is not None:
-        lock.acquire()
-    try:
-        snapshot = dict(os.environ)
-        instance = selected_instance_name()
-        config_env = os.getenv(CONFIG_ENV_VAR)
-        env_file = os.getenv("KOJUTSU_ENV_FILE")
-        if (
-            _CachedSettings is not None
-            and _CachedEnviron == snapshot
-            and _CachedInstance == instance
-            and _CachedConfigEnv == config_env
-            and _CachedEnvFile == env_file
-        ):
-            return _CachedSettings
-        settings = Settings()
-        _CachedSettings = settings
-        _CachedEnviron = snapshot
-        _CachedInstance = instance
-        _CachedConfigEnv = config_env
-        _CachedEnvFile = env_file
-        return settings
-    finally:
-        if lock is not None:
-            lock.release()
+    return _cache.get()

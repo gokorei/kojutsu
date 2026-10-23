@@ -19,21 +19,68 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_INTERVAL_SECONDS = 30.0
 DEFAULT_SHUTDOWN_TIMEOUT_SECONDS = 5.0
-_active_relay_tasks: set[asyncio.Task[Any]] = set()
 
-#: How many relay iterations have failed unexpectedly, in total and in a row.
-#: Logged with each failure and exposed via :func:`relay_error_counts` so a
-#: health check can tell a quiet outbox (nothing to send) from a broken one
-#: (sends keep raising). ``relay_loop`` swallows the exception to keep draining
-#: -- a relay that dies on the first poison row never delivers the valid rows
-#: behind it -- so without a counter that swallow would be silent.
-_relay_error_total: int = 0
-_relay_consecutive_errors: int = 0
+
+class RelayTracker:
+    """Owns the relay loop's process state: outstanding tasks and error counts.
+
+    The loop swallows relay exceptions to keep draining -- a relay that dies
+    on the first poison row never delivers the valid rows behind it -- so
+    without counters that swallow would be silent. Both live here rather than
+    in bare module globals so every transition (track, drain, count, reset)
+    goes through one type, and tests observe through its methods instead of
+    reaching into the set.
+    """
+
+    def __init__(self) -> None:
+        self._tasks: set[asyncio.Task[Any]] = set()
+        self._error_total = 0
+        self._consecutive_errors = 0
+
+    def track(self, task: asyncio.Task[Any]) -> asyncio.Task[Any]:
+        """Register a task until it finishes; return it for awaiting."""
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+        return task
+
+    def snapshot(self) -> tuple[asyncio.Task[Any], ...]:
+        """The currently outstanding tasks. A snapshot, not the set."""
+        return tuple(self._tasks)
+
+    def pending(self) -> int:
+        """How many relay tasks are outstanding."""
+        return len(self._tasks)
+
+    def note_success(self) -> None:
+        self._consecutive_errors = 0
+
+    def note_error(self) -> tuple[int, int]:
+        """Count one unexpected failure; return ``(total, consecutive)``."""
+        self._error_total += 1
+        self._consecutive_errors += 1
+        return self._error_total, self._consecutive_errors
+
+    def counts(self) -> tuple[int, int]:
+        """Return ``(total_errors, consecutive_errors)`` for the relay loop."""
+        return self._error_total, self._consecutive_errors
+
+
+_tracker = RelayTracker()
+
+
+def track_relay_task(task: asyncio.Task[Any]) -> asyncio.Task[Any]:
+    """Register a relay task until it finishes; the test-visible seam for it."""
+    return _tracker.track(task)
+
+
+def relay_tasks_pending() -> int:
+    """How many relay tasks are outstanding."""
+    return _tracker.pending()
 
 
 def relay_error_counts() -> tuple[int, int]:
     """Return ``(total_errors, consecutive_errors)`` for the relay loop."""
-    return (_relay_error_total, _relay_consecutive_errors)
+    return _tracker.counts()
 
 
 def resolve_relay_interval(interval: float | None = None) -> float:
@@ -64,15 +111,13 @@ async def relay_once() -> RelayResult:
     the failures visible.
     """
     runtime = runtime_module.get_runtime()
-    task = asyncio.create_task(asyncio.to_thread(runtime.relay))
-    _active_relay_tasks.add(task)
-    task.add_done_callback(_active_relay_tasks.discard)
+    task = track_relay_task(asyncio.create_task(asyncio.to_thread(runtime.relay)))
     # Shielded deliberately, not defensively. Cancelling the waiter must not
     # cancel this task: the thread it tracks keeps running either way (a
     # cancelled ``to_thread`` await does not stop the thread), but an
     # unshielded cancel would mark the *task* done while the thread still
-    # holds SQLite -- dropping it from ``_active_relay_tasks`` and letting
-    # shutdown ``reset_runtime`` (close the database) underneath live work.
+    # holds SQLite -- dropping it from the tracker and letting shutdown
+    # ``reset_runtime`` (close the database) underneath live work.
     # Shielded, the task stays tracked until the thread actually finishes, so
     # :func:`wait_for_relay_shutdown` waits for the work rather than for the
     # cancellation, and shutdown defers the reset while anything is outstanding.
@@ -104,7 +149,7 @@ async def wait_for_relay_shutdown(
     if timeout_seconds is not None:
         deadline = loop.time() + max(0.0, timeout_seconds)
     while True:
-        tasks = tuple(_active_relay_tasks)
+        tasks = _tracker.snapshot()
         if not tasks:
             return True
         remaining: float | None = None
@@ -117,13 +162,12 @@ async def wait_for_relay_shutdown(
 
 async def relay_loop(interval: float | None = None) -> None:
     """Periodically drain the outbox until cancelled."""
-    global _relay_error_total, _relay_consecutive_errors
     interval = resolve_relay_interval(interval)
     while True:
         await asyncio.sleep(interval)
         try:
             await relay_once()
-            _relay_consecutive_errors = 0
+            _tracker.note_success()
             runtime = runtime_module.get_runtime()
             maintenance = getattr(runtime, "maintenance", None)
             if callable(maintenance):
@@ -139,11 +183,10 @@ async def relay_loop(interval: float | None = None) -> None:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            _relay_error_total += 1
-            _relay_consecutive_errors += 1
+            total, consecutive = _tracker.note_error()
             logger.exception(
                 "Outbox relay failed unexpectedly: %s (total=%d consecutive=%d)",
                 type(exc).__name__,
-                _relay_error_total,
-                _relay_consecutive_errors,
+                total,
+                consecutive,
             )

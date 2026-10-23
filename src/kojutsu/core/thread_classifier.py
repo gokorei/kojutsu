@@ -77,6 +77,7 @@ from kojutsu.integrations.llm import (
     THREAD_CLASSIFIER_TASK_CLAUSE,
     ParsedClassification,
     ParsedPair,
+    ParsedSingle,
     bounded_source_text,
     complete_task,
     parse_classification_response,
@@ -650,6 +651,134 @@ def _pair_refusal_reason(
     return None
 
 
+@dataclass
+class _AssemblyWork:
+    """Mutable placement state for one :func:`_assemble` run."""
+
+    placed: dict[int, ThreadPair | ThreadSingle]
+    released: dict[int, str]
+    unknown: set[int]
+    declines: int = 0
+    conflicts: int = 0
+
+
+def _claim_parsed_pair(
+    item: ParsedPair,
+    *,
+    supplied: set[int],
+    position: dict[int, int],
+    work: _AssemblyWork,
+    min_confidence: float,
+) -> None:
+    """Place one claimed pairing, or release/refuse it, updating ``work``."""
+    named = (item.question_comment_id, item.answer_comment_id)
+    if any(comment_id not in supplied for comment_id in named):
+        work.unknown.update(named)
+        return
+    already = [comment_id for comment_id in named if comment_id in work.placed]
+    if already:
+        # A contradiction, and the first claim stands. The other comment
+        # this line names is released rather than left unaccounted: the
+        # model did mention it, so reporting the run as short a comment
+        # would misdescribe what happened, and dropping it would lose a
+        # real comment to a bookkeeping detail of the model's own.
+        work.conflicts += 1
+        for comment_id in named:
+            if comment_id not in work.placed:
+                work.released.setdefault(
+                    comment_id,
+                    f"the model placed comment {comment_id} in two pairings, "
+                    f"and comment {already[0]} was already placed",
+                )
+        return
+    reason = _pair_refusal_reason(item, position=position, min_confidence=min_confidence)
+    if reason is not None:
+        work.declines += 1
+        for comment_id in named:
+            work.released.setdefault(comment_id, reason)
+        return
+    work.placed[item.answer_comment_id] = ThreadPair(
+        question_comment_id=item.question_comment_id,
+        answer_comment_id=item.answer_comment_id,
+        inferred_question=item.inferred_question,
+        confidence=item.confidence,
+        anchored=False,
+        category=item.category,
+    )
+    work.placed[item.question_comment_id] = work.placed[item.answer_comment_id]
+
+
+def _claim_parsed_single(
+    item: ParsedSingle,
+    *,
+    supplied: set[int],
+    work: _AssemblyWork,
+) -> None:
+    """Place one standalone claim, counting a contradiction, updating ``work``."""
+    if item.comment_id not in supplied:
+        work.unknown.add(item.comment_id)
+        return
+    if item.comment_id in work.placed:
+        work.conflicts += 1
+        return
+    work.placed[item.comment_id] = ThreadSingle(
+        comment_id=item.comment_id,
+        kind=_single_kind(item.kind),
+        declined_reason=item.declined_reason,
+    )
+
+
+def _release_declined_comments(work: _AssemblyWork) -> None:
+    """Stand released comments alone, without overriding an explicit claim."""
+    for comment_id, reason in work.released.items():
+        if comment_id in work.placed:
+            continue
+        work.placed[comment_id] = ThreadSingle(
+            comment_id=comment_id,
+            kind=SingleKind.CLARIFICATION,
+            declined_reason=reason,
+        )
+
+
+def _reject_incomplete_assembly(supplied: set[int], work: _AssemblyWork) -> None:
+    """Raise on hallucinated or unaccounted comment ids."""
+    if work.unknown:
+        # A model error, not a result. An id nobody supplied is a hallucinated
+        # comment, and storing against it would put a real person's answer under a
+        # key no re-fetch of the thread can resolve.
+        raise ThreadClassificationError(
+            "the model referenced comment id(s) that were not in the thread: "
+            + ", ".join(str(comment_id) for comment_id in sorted(work.unknown))
+        )
+    missing = sorted(supplied - set(work.placed))
+    if missing:
+        raise ThreadClassificationError(
+            "the model did not account for comment id(s) "
+            + ", ".join(str(comment_id) for comment_id in missing)
+            + "; a partial classification is refused rather than stored, because a "
+            "comment that went unread is indistinguishable from one nobody posted"
+        )
+
+
+def _order_placed_items(
+    classifiable: list[GitHubComment],
+    work: _AssemblyWork,
+) -> list[ThreadPair | ThreadSingle]:
+    """Emit placed items in thread order, each pair once."""
+    # In thread order, because that is the order a reader of the thread has in
+    # mind, and each pair emitted once even though it covers two comments.
+    ordered: list[ThreadPair | ThreadSingle] = []
+    emitted_pairs: set[int] = set()
+    for comment in classifiable:
+        item = work.placed[comment.id]
+        if isinstance(item, ThreadPair):
+            if item.answer_comment_id in emitted_pairs:
+                continue
+            emitted_pairs.add(item.answer_comment_id)
+        ordered.append(item)
+    return ordered
+
+
 def _assemble(
     parsed: ParsedClassification,
     *,
@@ -681,123 +810,28 @@ def _assemble(
     """
     supplied = {comment.id for comment in classifiable}
     position = {comment.id: index for index, comment in enumerate(classifiable)}
-    placed: dict[int, ThreadPair | ThreadSingle] = {}
-    released: dict[int, str] = {}
-    unknown: set[int] = set()
-    declines = 0
-    conflicts = 0
+    work = _AssemblyWork(placed={}, released={}, unknown=set())
 
     for item in parsed.items:
         if isinstance(item, ParsedPair):
-            named = (item.question_comment_id, item.answer_comment_id)
-            if any(comment_id not in supplied for comment_id in named):
-                unknown.update(named)
-                continue
-            already = [comment_id for comment_id in named if comment_id in placed]
-            if already:
-                # A contradiction, and the first claim stands. The other comment
-                # this line names is released rather than left unaccounted: the
-                # model did mention it, so reporting the run as short a comment
-                # would misdescribe what happened, and dropping it would lose a
-                # real comment to a bookkeeping detail of the model's own.
-                conflicts += 1
-                for comment_id in named:
-                    if comment_id not in placed:
-                        released.setdefault(
-                            comment_id,
-                            f"the model placed comment {comment_id} in two pairings, "
-                            f"and comment {already[0]} was already placed",
-                        )
-                continue
-            reason = _pair_refusal_reason(item, position=position, min_confidence=min_confidence)
-            if reason is not None:
-                declines += 1
-                for comment_id in named:
-                    released.setdefault(comment_id, reason)
-                continue
-            placed[item.answer_comment_id] = ThreadPair(
-                question_comment_id=item.question_comment_id,
-                answer_comment_id=item.answer_comment_id,
-                inferred_question=item.inferred_question,
-                confidence=item.confidence,
-                anchored=False,
-                category=item.category,
+            _claim_parsed_pair(
+                item,
+                supplied=supplied,
+                position=position,
+                work=work,
+                min_confidence=min_confidence,
             )
-            placed[item.question_comment_id] = placed[item.answer_comment_id]
             continue
-        if item.comment_id not in supplied:
-            unknown.add(item.comment_id)
-            continue
-        if item.comment_id in placed:
-            conflicts += 1
-            continue
-        placed[item.comment_id] = ThreadSingle(
-            comment_id=item.comment_id,
-            kind=_single_kind(item.kind),
-            declined_reason=item.declined_reason,
-        )
+        _claim_parsed_single(item, supplied=supplied, work=work)
 
-    for comment_id, reason in released.items():
-        if comment_id in placed:
-            continue
-        placed[comment_id] = ThreadSingle(
-            comment_id=comment_id,
-            kind=SingleKind.CLARIFICATION,
-            declined_reason=reason,
-        )
-
-    if unknown:
-        # A model error, not a result. An id nobody supplied is a hallucinated
-        # comment, and storing against it would put a real person's answer under a
-        # key no re-fetch of the thread can resolve.
-        raise ThreadClassificationError(
-            "the model referenced comment id(s) that were not in the thread: "
-            + ", ".join(str(comment_id) for comment_id in sorted(unknown))
-        )
-    missing = sorted(supplied - set(placed))
-    if missing:
-        raise ThreadClassificationError(
-            "the model did not account for comment id(s) "
-            + ", ".join(str(comment_id) for comment_id in missing)
-            + "; a partial classification is refused rather than stored, because a "
-            "comment that went unread is indistinguishable from one nobody posted"
-        )
-    # In thread order, because that is the order a reader of the thread has in
-    # mind, and each pair emitted once even though it covers two comments.
-    ordered: list[ThreadPair | ThreadSingle] = []
-    emitted_pairs: set[int] = set()
-    for comment in classifiable:
-        item = placed[comment.id]
-        if isinstance(item, ThreadPair):
-            if item.answer_comment_id in emitted_pairs:
-                continue
-            emitted_pairs.add(item.answer_comment_id)
-        ordered.append(item)
-    return ordered, declines, conflicts
+    _release_declined_comments(work)
+    _reject_incomplete_assembly(supplied, work)
+    ordered = _order_placed_items(classifiable, work)
+    return ordered, work.declines, work.conflicts
 
 
-def classify_thread(
-    comments: list[GitHubComment],
-    *,
-    repo: str,
-    pr_number: int,
-    model: str,
-    timeout_seconds: float = 120.0,
-    max_items: int = MAX_CLASSIFICATION_ITEMS,
-    min_confidence: float = MIN_PAIR_CONFIDENCE,
-) -> ThreadClassification:
-    """Read a thread and place every comment in it. Writes nothing anywhere.
-
-    Anchor precedence happens first and in code: see
-    :func:`resolve_anchored_pairs`. Only what the markers did not already decide is
-    sent to the model, and the model's answer must place every comment it was sent
-    or the run raises. That is the whole contract -- the store is downstream of it,
-    in :func:`store_classification`, and is never reached with a hole in it.
-
-    A thread with nothing to classify, or one whose comments are all anchored, is
-    not a model call. An empty classification is the honest result there, and
-    ``model_calls: 0`` in the coverage says why.
-    """
+def _validate_classify_request(repo: str, min_confidence: float) -> None:
+    """Refuse a classification request with no repo or an unusable floor."""
     if not repo.strip():
         raise ThreadClassificationError("a classification names one repository")
     # Validated rather than clamped: a floor of 0 accepts every pairing, which is
@@ -809,6 +843,12 @@ def classify_thread(
         raise ThreadClassificationError(
             f"min_confidence must be a number from 0 to 1, got {min_confidence!r}"
         )
+
+
+def _prepare_classifiable_comments(
+    comments: list[GitHubComment],
+) -> tuple[list[GitHubComment], AnchoredResolution, list[GitHubComment]]:
+    """Order the thread, resolve markers, and return what the model must place."""
     ordered = sorted(comments, key=lambda comment: (comment.created_at, comment.id))
     anchored = resolve_anchored_pairs(ordered)
     classifiable = [comment for comment in ordered if comment.id not in anchored.owned_comment_ids]
@@ -819,7 +859,18 @@ def classify_thread(
             "should be looked at rather than classified blind: at least one comment "
             "in it is doing something the bounds here do not model."
         )
+    return ordered, anchored, classifiable
 
+
+def _infer_thread_items(
+    classifiable: list[GitHubComment],
+    *,
+    model: str,
+    timeout_seconds: float,
+    max_items: int,
+    min_confidence: float,
+) -> tuple[list[ThreadPair | ThreadSingle], int, int, int, int]:
+    """Call the model once and assemble its response into items and counters."""
     items: list[ThreadPair | ThreadSingle] = []
     declines = 0
     conflicts = 0
@@ -847,9 +898,21 @@ def classify_thread(
         items, declines, conflicts = _assemble(
             parsed, classifiable=classifiable, min_confidence=min_confidence
         )
+    return items, declines, conflicts, unattributable, model_calls
 
+
+def _build_thread_coverage(
+    ordered: list[GitHubComment],
+    anchored: AnchoredResolution,
+    items: list[ThreadPair | ThreadSingle],
+    declines: int,
+    conflicts: int,
+    unattributable: int,
+    model_calls: int,
+) -> ThreadCoverage:
+    """Tally where every comment ended up, anchored and inferred together."""
     singles = [item for item in items if isinstance(item, ThreadSingle)]
-    coverage = ThreadCoverage(
+    return ThreadCoverage(
         comments=len(ordered),
         anchored_pairs=len(anchored.pairs),
         anchored_questions=len(anchored.unanswered_question_ids),
@@ -872,6 +935,19 @@ def classify_thread(
             )
         ),
     )
+
+
+def _finish_thread_classification(
+    ordered: list[GitHubComment],
+    anchored: AnchoredResolution,
+    items: list[ThreadPair | ThreadSingle],
+    coverage: ThreadCoverage,
+    *,
+    repo: str,
+    pr_number: int,
+    model: str,
+) -> ThreadClassification:
+    """Check the coverage invariant and deliver the classification."""
     if not coverage.complete:
         # Unreachable while ``_assemble`` holds, and stated anyway: the invariant
         # this module rests on should be checked where the coverage is reported,
@@ -888,6 +964,45 @@ def classify_thread(
         items=tuple(items),
         anchored=anchored.pairs,
         coverage=coverage,
+    )
+
+
+def classify_thread(
+    comments: list[GitHubComment],
+    *,
+    repo: str,
+    pr_number: int,
+    model: str,
+    timeout_seconds: float = 120.0,
+    max_items: int = MAX_CLASSIFICATION_ITEMS,
+    min_confidence: float = MIN_PAIR_CONFIDENCE,
+) -> ThreadClassification:
+    """Read a thread and place every comment in it. Writes nothing anywhere.
+
+    Anchor precedence happens first and in code: see
+    :func:`resolve_anchored_pairs`. Only what the markers did not already decide is
+    sent to the model, and the model's answer must place every comment it was sent
+    or the run raises. That is the whole contract -- the store is downstream of it,
+    in :func:`store_classification`, and is never reached with a hole in it.
+
+    A thread with nothing to classify, or one whose comments are all anchored, is
+    not a model call. An empty classification is the honest result there, and
+    ``model_calls: 0`` in the coverage says why.
+    """
+    _validate_classify_request(repo, min_confidence)
+    ordered, anchored, classifiable = _prepare_classifiable_comments(comments)
+    items, declines, conflicts, unattributable, model_calls = _infer_thread_items(
+        classifiable,
+        model=model,
+        timeout_seconds=timeout_seconds,
+        max_items=max_items,
+        min_confidence=min_confidence,
+    )
+    coverage = _build_thread_coverage(
+        ordered, anchored, items, declines, conflicts, unattributable, model_calls
+    )
+    return _finish_thread_classification(
+        ordered, anchored, items, coverage, repo=repo, pr_number=pr_number, model=model
     )
 
 
@@ -1000,48 +1115,18 @@ class StoredClassification:
         }
 
 
-def store_classification(
+def _store_inferred_pairs(
     classification: ThreadClassification,
-    *,
-    comments: list[GitHubComment],
+    by_id: dict[int, GitHubComment],
     sink: KnowledgeSink,
-    policy: ClarificationPolicy | None = None,
-    capture_source: CaptureSource = CaptureSource.COLLECT,
-    captured_at: datetime | None = None,
-    delivery_id: str | None = None,
-) -> StoredClassification:
-    """Write the records a classification earned, and nothing else.
-
-    Three outcomes, three destinations, and the third has none:
-
-    - An inferred pair becomes a :class:`KnowledgeEntry` marked ``inferred`` and
-      naming the model, with the reconstructed question labelled as reconstructed
-      in the document body.
-    - A clarification becomes a :class:`ClarificationEntry`, through
-      :func:`clarification_from_comment` and :class:`ClarificationPolicy` -- the
-      same two the ungated collector uses, so the question of *which* unprompted
-      comments are worth holding has one answer in this system and not a second
-      rule that drifts from it.
-    - An unrelated comment produces no record at all. Storing it would mean the
-      store grew a row nobody asked for, which is the manufactured-consensus failure
-      with the label taken off.
-
-    Anchored pairs are not written here. The markers put them through the existing
-    answer path already, and their comments are excluded from the model's input, so
-    a write from this module would be a second record for one person's words.
-    """
-    if not classification.coverage.complete:
-        raise ThreadClassificationError(
-            "refusing to store a classification that left comments unplaced"
-        )
-    policy = policy or ClarificationPolicy()
-    by_id = {comment.id: comment for comment in comments}
-    entries: list[KnowledgeEntry] = []
-    clarifications: list[ClarificationEntry] = []
-    unrelated: list[int] = []
-    rejected: list[int] = []
-    outcomes: list[KnowledgeDeliveryOutcome | None] = []
-
+    entries: list[KnowledgeEntry],
+    outcomes: list[KnowledgeDeliveryOutcome | None],
+    *,
+    capture_source: CaptureSource,
+    captured_at: datetime | None,
+    delivery_id: str | None,
+) -> None:
+    """Store one record per inferred pair, appending entries and outcomes."""
     for pair in classification.inferred_pairs:
         answer = by_id.get(pair.answer_comment_id)
         if answer is None:
@@ -1063,6 +1148,22 @@ def store_classification(
         entries.append(entry)
         outcomes.append(sink.store(entry))
 
+
+def _store_thread_singles(
+    classification: ThreadClassification,
+    by_id: dict[int, GitHubComment],
+    sink: KnowledgeSink,
+    policy: ClarificationPolicy,
+    clarifications: list[ClarificationEntry],
+    outcomes: list[KnowledgeDeliveryOutcome | None],
+    unrelated: list[int],
+    rejected: list[int],
+    *,
+    capture_source: CaptureSource,
+    captured_at: datetime | None,
+    delivery_id: str | None,
+) -> None:
+    """Store clarifications, dropping unrelated and policy-rejected comments."""
     for single in classification.singles:
         comment = by_id.get(single.comment_id)
         if single.kind is SingleKind.UNRELATED:
@@ -1094,6 +1195,24 @@ def store_classification(
         clarifications.append(entry)
         outcomes.append(sink.store(entry))
 
+
+def _require_complete_coverage(classification: ThreadClassification) -> None:
+    """Refuse a classification that left comments unplaced."""
+    if not classification.coverage.complete:
+        raise ThreadClassificationError(
+            "refusing to store a classification that left comments unplaced"
+        )
+
+
+def _build_stored_classification(
+    classification: ThreadClassification,
+    entries: list[KnowledgeEntry],
+    clarifications: list[ClarificationEntry],
+    outcomes: list[KnowledgeDeliveryOutcome | None],
+    unrelated: list[int],
+    rejected: list[int],
+) -> StoredClassification:
+    """Wrap stored records, drops, and anchored ids into the result."""
     return StoredClassification(
         entries=tuple(entries),
         clarifications=tuple(clarifications),
@@ -1103,6 +1222,74 @@ def store_classification(
         ),
         outcomes=tuple(outcomes),
         policy_rejected_comment_ids=tuple(rejected),
+    )
+
+
+def store_classification(
+    classification: ThreadClassification,
+    *,
+    comments: list[GitHubComment],
+    sink: KnowledgeSink,
+    policy: ClarificationPolicy | None = None,
+    capture_source: CaptureSource = CaptureSource.COLLECT,
+    captured_at: datetime | None = None,
+    delivery_id: str | None = None,
+) -> StoredClassification:
+    """Write the records a classification earned, and nothing else.
+
+    Three outcomes, three destinations, and the third has none:
+
+    - An inferred pair becomes a :class:`KnowledgeEntry` marked ``inferred`` and
+      naming the model, with the reconstructed question labelled as reconstructed
+      in the document body.
+    - A clarification becomes a :class:`ClarificationEntry`, through
+      :func:`clarification_from_comment` and :class:`ClarificationPolicy` -- the
+      same two the ungated collector uses, so the question of *which* unprompted
+      comments are worth holding has one answer in this system and not a second
+      rule that drifts from it.
+    - An unrelated comment produces no record at all. Storing it would mean the
+      store grew a row nobody asked for, which is the manufactured-consensus failure
+      with the label taken off.
+
+    Anchored pairs are not written here. The markers put them through the existing
+    answer path already, and their comments are excluded from the model's input, so
+    a write from this module would be a second record for one person's words.
+    """
+    _require_complete_coverage(classification)
+    policy = policy or ClarificationPolicy()
+    by_id = {comment.id: comment for comment in comments}
+    entries: list[KnowledgeEntry] = []
+    clarifications: list[ClarificationEntry] = []
+    unrelated: list[int] = []
+    rejected: list[int] = []
+    outcomes: list[KnowledgeDeliveryOutcome | None] = []
+
+    _store_inferred_pairs(
+        classification,
+        by_id,
+        sink,
+        entries,
+        outcomes,
+        capture_source=capture_source,
+        captured_at=captured_at,
+        delivery_id=delivery_id,
+    )
+    _store_thread_singles(
+        classification,
+        by_id,
+        sink,
+        policy,
+        clarifications,
+        outcomes,
+        unrelated,
+        rejected,
+        capture_source=capture_source,
+        captured_at=captured_at,
+        delivery_id=delivery_id,
+    )
+
+    return _build_stored_classification(
+        classification, entries, clarifications, outcomes, unrelated, rejected
     )
 
 

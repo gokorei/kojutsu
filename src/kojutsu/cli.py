@@ -116,6 +116,21 @@ def serve(
             "Set GITHUB_WEBHOOK_SECRET before binding the webhook server publicly.", err=True
         )
         raise typer.Exit(1)
+    if public_bind:
+        from kojutsu import allowlist as allowlist_module
+
+        try:
+            scope = allowlist_module.configured_repositories(settings)
+        except Exception as exc:
+            typer.echo(f"Repository allowlist is not usable: {exc}", err=True)
+            raise typer.Exit(1) from None
+        if not scope:
+            typer.echo(
+                "Set GITHUB_WEBHOOK_ALLOWED_REPOSITORIES before binding publicly; "
+                "an empty allowlist denies every repository.",
+                err=True,
+            )
+            raise typer.Exit(1)
     if public_bind and settings.github_webhook_register:
         if not webhook_url:
             typer.echo(

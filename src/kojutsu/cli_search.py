@@ -1,12 +1,15 @@
 """CLI commands: search knowledge and list registry work."""
 
-from typing import Any, cast
-
 import typer
 
 from kojutsu.cli_shared import _require_tanseki, _settings
 from kojutsu.core.question_registry import QUESTION_STATUSES, build_registry
-from kojutsu.integrations.tanseki import TansekiClient, TansekiError, bound_search_limit
+from kojutsu.integrations.tanseki import (
+    TansekiClient,
+    TansekiDocument,
+    TansekiError,
+    bound_search_limit,
+)
 
 
 def search_cmd(
@@ -29,25 +32,15 @@ def search_cmd(
         limit = bound_search_limit(limit)
         client = TansekiClient.from_settings(settings)
         try:
-            documents: list = []
-            search_documents = cast(Any, getattr(client, "search_documents", None))
-            if search_documents is not None:
-                documents = list(
-                    search_documents(
-                        text or "",
-                        frontmatter=filters or None,
-                        limit=limit,
-                    )
+            documents: list[TansekiDocument] = list(
+                client.search_documents(
+                    text or "",
+                    frontmatter=filters or None,
+                    limit=limit,
                 )
-            else:
-                for hit in client.search(text or "", frontmatter=filters or None, limit=limit):
-                    document = client.get_document(hit.id)
-                    if document is not None:
-                        documents.append(document)
+            )
         finally:
-            close = getattr(client, "close", None)
-            if callable(close):
-                close()
+            client.close()
     except ValueError as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(1) from None

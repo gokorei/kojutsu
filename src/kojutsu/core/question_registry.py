@@ -277,40 +277,12 @@ class QuestionRegistry(Protocol):
     ) -> int: ...
 
 
-class SqliteQuestionRegistry:
-    """SQLite-backed :class:`QuestionRegistry`."""
+class _DeliveryLedger:
+    """Owns the webhook_deliveries rows: leases, retries, retention."""
 
-    def __init__(self, path: str | Path) -> None:
-        self.path = Path(path).expanduser()
-        parent_created = not self.path.parent.exists()
-        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        if parent_created:
-            self.path.parent.chmod(0o700)
-        self._secure_database_file()
-        self._db = sqlite3.connect(str(self.path), check_same_thread=False, timeout=5.0)
-        self._lock = threading.RLock()
-        try:
-            configure_durable_connection(self._db)
-            self._db.executescript(_SCHEMA)
-            _migrate_schema(self._db)
-        except Exception:
-            self._db.close()
-            raise
-
-    def _secure_database_file(self) -> None:
-        flags = os.O_CREAT | os.O_RDWR
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        descriptor = os.open(self.path, flags, 0o600)
-        try:
-            file_stat = os.fstat(descriptor)
-            if not stat.S_ISREG(file_stat.st_mode):
-                raise PermissionError("Question registry path must be a regular file")
-            if hasattr(os, "geteuid") and file_stat.st_uid != os.geteuid():
-                raise PermissionError("Question registry file must be owned by the current user")
-            os.fchmod(descriptor, 0o600)
-        finally:
-            os.close(descriptor)
+    def __init__(self, db: sqlite3.Connection, lock: threading.RLock) -> None:
+        self._db = db
+        self._lock = lock
 
     def cleanup_deliveries(
         self, retention_days: int = DELIVERY_RETENTION_DAYS, *, limit: int = 1_000
@@ -358,6 +330,922 @@ class SqliteQuestionRegistry:
                 self._db.rollback()
                 raise
             return len(rows)
+
+    def claim_delivery(
+        self, delivery_id: str, repo: str, event: str, payload_hash: str
+    ) -> DeliveryClaim:
+        now = datetime.now(UTC)
+        lease = now + DELIVERY_LEASE
+        claim_token = secrets.token_urlsafe(32)
+        with self._lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._db.execute(
+                    """
+                    SELECT repo, event, payload_hash, status, lease_expires_at
+                    FROM webhook_deliveries WHERE delivery_id = ?
+                    """,
+                    (delivery_id,),
+                ).fetchone()
+                if row is not None:
+                    if row[0] != repo or row[1] != event:
+                        self._db.rollback()
+                        return "conflict"
+                    if row[2] not in {"", payload_hash}:
+                        self._db.rollback()
+                        return "conflict"
+                    if row[3] == "completed":
+                        self._db.rollback()
+                        return "duplicate"
+                    if row[3] == "processing" and row[4] and row[4] > now.isoformat():
+                        self._db.rollback()
+                        return "active"
+                    self._db.execute(
+                        """
+                        UPDATE webhook_deliveries
+                        SET status = 'processing', claimed_at = ?, lease_expires_at = ?,
+                            last_error = NULL, completed_at = NULL, claim_token = ?
+                        WHERE delivery_id = ?
+                        """,
+                        (now.isoformat(), lease.isoformat(), claim_token, delivery_id),
+                    )
+                else:
+                    self._db.execute(
+                        """
+                        INSERT INTO webhook_deliveries (
+                            delivery_id, repo, event, payload_hash, status, claimed_at,
+                            lease_expires_at, last_error, completed_at, claim_token, created_at
+                        ) VALUES (?, ?, ?, ?, 'processing', ?, ?, NULL, NULL, ?, ?)
+                        """,
+                        (
+                            delivery_id,
+                            repo,
+                            event,
+                            payload_hash,
+                            now.isoformat(),
+                            lease.isoformat(),
+                            claim_token,
+                            now.isoformat(),
+                        ),
+                    )
+                self._db.commit()
+            except Exception:
+                self._db.rollback()
+                raise
+        return claim_token
+
+    def complete_delivery(self, delivery_id: str, claim_token: str) -> bool:
+        now = _now()
+        with self._lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = self._db.execute(
+                    """
+                    UPDATE webhook_deliveries
+                    SET status = 'completed', completed_at = ?, lease_expires_at = NULL,
+                        last_error = NULL
+                    WHERE delivery_id = ?
+                      AND status = 'processing'
+                      AND claim_token = ?
+                    """,
+                    (now, delivery_id, claim_token),
+                )
+                self._db.commit()
+            except Exception:
+                self._db.rollback()
+                raise
+            else:
+                return cursor.rowcount == 1
+
+    def release_delivery(self, delivery_id: str, claim_token: str, error: str) -> bool:
+        now = _now()
+        with self._lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = self._db.execute(
+                    """
+                    UPDATE webhook_deliveries
+                    SET status = 'retryable', lease_expires_at = ?, last_error = ?
+                    WHERE delivery_id = ?
+                      AND status = 'processing'
+                      AND claim_token = ?
+                    """,
+                    (now, error[:1000], delivery_id, claim_token),
+                )
+                self._db.commit()
+            except Exception:
+                self._db.rollback()
+                raise
+            else:
+                return cursor.rowcount == 1
+
+
+class _ReviewLedger:
+    """Owns the review_captures rows: verdict and inline claims."""
+
+    def __init__(self, db: sqlite3.Connection, lock: threading.RLock) -> None:
+        self._db = db
+        self._lock = lock
+
+    def claim_review_capture(
+        self,
+        *,
+        review_event_id: str,
+        repo: str,
+        pr_number: int,
+        review_id: int,
+        comment_id: int | None,
+        kind: str,
+        author: str | None,
+    ) -> str | None:
+        """Take a lease on one review record, or ``None`` if it is already captured.
+
+        Deduplication has two independent keys here. ``review_event_id`` is the
+        semantic identity, so a redelivered or re-serialised event collapses to one
+        record. ``comment_id`` is separately unique-indexed, which closes the gap
+        where the same inline comment arrives under two different review payload
+        shapes: the second insert hits the unique index and is refused rather than
+        producing a duplicate entry.
+        """
+        if not review_event_id:
+            raise ValueError("review_event_id must not be empty")
+        now = datetime.now(UTC)
+        lease = now + PR_EVENT_LEASE
+        claim_token = secrets.token_urlsafe(32)
+        with self._lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._db.execute(
+                    """
+                    SELECT repo, pr_number, review_id, comment_id, kind, status, lease_expires_at
+                    FROM review_captures WHERE review_event_id = ?
+                    """,
+                    (review_event_id,),
+                ).fetchone()
+                if row is not None:
+                    if (row[0], row[1], row[2], row[3], row[4]) != (
+                        repo,
+                        pr_number,
+                        review_id,
+                        comment_id,
+                        kind,
+                    ):
+                        self._db.rollback()
+                        return None
+                    if row[5] == "completed":
+                        self._db.rollback()
+                        return None
+                    if row[5] == "processing" and row[6] and row[6] > now.isoformat():
+                        self._db.rollback()
+                        return None
+                    self._db.execute(
+                        """
+                        UPDATE review_captures
+                        SET status = 'processing', claimed_at = ?, lease_expires_at = ?,
+                            last_error = NULL, completed_at = NULL, claim_token = ?
+                        WHERE review_event_id = ?
+                        """,
+                        (now.isoformat(), lease.isoformat(), claim_token, review_event_id),
+                    )
+                else:
+                    self._db.execute(
+                        """
+                        INSERT INTO review_captures (
+                            review_event_id, repo, pr_number, review_id, comment_id, kind,
+                            author, status, claimed_at, lease_expires_at, last_error,
+                            completed_at, claim_token
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'processing', ?, ?, NULL, NULL, ?)
+                        """,
+                        (
+                            review_event_id,
+                            repo,
+                            pr_number,
+                            review_id,
+                            comment_id,
+                            kind,
+                            author,
+                            now.isoformat(),
+                            lease.isoformat(),
+                            claim_token,
+                        ),
+                    )
+                self._db.commit()
+            except sqlite3.IntegrityError:
+                # A comment already captured under a different event identity.
+                self._db.rollback()
+                return None
+            except Exception:
+                self._db.rollback()
+                raise
+        return claim_token
+
+    def complete_review_capture(self, review_event_id: str, claim_token: str) -> bool:
+        now = _now()
+        with self._lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = self._db.execute(
+                    """
+                    UPDATE review_captures
+                    SET status = 'completed', completed_at = ?, lease_expires_at = NULL,
+                        last_error = NULL
+                    WHERE review_event_id = ? AND status = 'processing' AND claim_token = ?
+                    """,
+                    (now, review_event_id, claim_token),
+                )
+                self._db.commit()
+            except Exception:
+                self._db.rollback()
+                raise
+            else:
+                return cursor.rowcount == 1
+
+    def release_review_capture(self, review_event_id: str, claim_token: str, error: str) -> bool:
+        now = _now()
+        with self._lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = self._db.execute(
+                    """
+                    UPDATE review_captures
+                    SET status = 'retryable', lease_expires_at = ?, last_error = ?
+                    WHERE review_event_id = ? AND status = 'processing' AND claim_token = ?
+                    """,
+                    (now, error[:1000], review_event_id, claim_token),
+                )
+                self._db.commit()
+            except Exception:
+                self._db.rollback()
+                raise
+            else:
+                return cursor.rowcount == 1
+
+
+class _RationaleLedger:
+    """Owns the rationale_captures rows: declarations and revisions."""
+
+    def __init__(self, db: sqlite3.Connection, lock: threading.RLock) -> None:
+        self._db = db
+        self._lock = lock
+
+    def claim_rationale(
+        self,
+        *,
+        entry_id: str,
+        repo: str,
+        pr_number: int | None,
+        branch: str,
+        declared_by: str,
+        declared_model: str | None,
+        source: str,
+        revision: int,
+        revises: str | None,
+        rationale_text: str,
+    ) -> str | None:
+        """Take a lease on one declared rationale, or ``None`` if already captured.
+
+        Deduplication has two independent keys, mirroring
+        :meth:`claim_review_capture`. ``entry_id`` is the semantic identity derived
+        from the anchor, so a re-delivery collapses to one record. The unique index
+        over ``(repo, pr_number, branch, declared_by, revision)`` closes the gap
+        where the same declaration arrives under two different derived ids: the
+        second insert hits the index and is refused rather than storing the same
+        statement twice.
+
+        A claim whose lease has expired may be taken again, and the previous
+        holder's ``claim_token`` stops working at that moment, so a crashed
+        collector cannot be completed by a caller that no longer holds the work.
+        """
+        if not entry_id:
+            raise ValueError("entry_id must not be empty")
+        now = datetime.now(UTC)
+        lease = now + RATIONALE_LEASE
+        claim_token = secrets.token_urlsafe(32)
+        with self._lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._db.execute(
+                    """
+                    SELECT repo, pr_number, branch, declared_by, source, revision, revises,
+                           status, lease_expires_at
+                    FROM rationale_captures WHERE entry_id = ?
+                    """,
+                    (entry_id,),
+                ).fetchone()
+                if row is not None:
+                    if not self._reclaim_rationale_row(
+                        row,
+                        entry_id,
+                        repo,
+                        pr_number,
+                        branch,
+                        declared_by,
+                        source,
+                        revision,
+                        revises,
+                        now,
+                        lease,
+                        claim_token,
+                    ):
+                        return None
+                else:
+                    self._insert_rationale_row(
+                        entry_id,
+                        repo,
+                        pr_number,
+                        branch,
+                        declared_by,
+                        declared_model,
+                        source,
+                        revision,
+                        revises,
+                        rationale_text,
+                        now,
+                        lease,
+                        claim_token,
+                    )
+                self._db.commit()
+            except sqlite3.IntegrityError:
+                # A declaration already captured under a different derived id.
+                self._db.rollback()
+                return None
+            except Exception:
+                self._db.rollback()
+                raise
+        return claim_token
+
+    def _reclaim_rationale_row(
+        self,
+        row: tuple[Any, ...],
+        entry_id: str,
+        repo: str,
+        pr_number: int | None,
+        branch: str,
+        declared_by: str,
+        source: str,
+        revision: int,
+        revises: str | None,
+        now: datetime,
+        lease: datetime,
+        claim_token: str,
+    ) -> bool:
+        """Re-lease an existing rationale row. False means already captured."""
+        if (row[0], row[1], row[2], row[3], row[4], row[5], row[6]) != (
+            repo,
+            pr_number,
+            branch,
+            declared_by,
+            source,
+            revision,
+            revises,
+        ):
+            # The same id now describes something else, which means the
+            # derivation moved. Refuse rather than overwrite a stored
+            # record with a different one.
+            self._db.rollback()
+            return False
+        if row[7] == "completed":
+            self._db.rollback()
+            return False
+        if row[7] == "processing" and row[8] and row[8] > now.isoformat():
+            self._db.rollback()
+            return False
+        self._db.execute(
+            """
+            UPDATE rationale_captures
+            SET status = 'processing', claimed_at = ?, lease_expires_at = ?,
+                last_error = NULL, completed_at = NULL, claim_token = ?
+            WHERE entry_id = ?
+            """,
+            (now.isoformat(), lease.isoformat(), claim_token, entry_id),
+        )
+        return True
+
+    def _insert_rationale_row(
+        self,
+        entry_id: str,
+        repo: str,
+        pr_number: int | None,
+        branch: str,
+        declared_by: str,
+        declared_model: str | None,
+        source: str,
+        revision: int,
+        revises: str | None,
+        rationale_text: str,
+        now: datetime,
+        lease: datetime,
+        claim_token: str,
+    ) -> None:
+        self._db.execute(
+            """
+            INSERT INTO rationale_captures (
+                entry_id, repo, pr_number, branch, declared_by, declared_model,
+                source, revision, revises, rationale_text, status, claimed_at,
+                lease_expires_at, last_error, completed_at, claim_token
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'processing', ?, ?, NULL, NULL, ?)
+            """,
+            (
+                entry_id,
+                repo,
+                pr_number,
+                branch,
+                declared_by,
+                declared_model,
+                source,
+                revision,
+                revises,
+                rationale_text,
+                now.isoformat(),
+                lease.isoformat(),
+                claim_token,
+            ),
+        )
+
+    def complete_rationale(self, entry_id: str, claim_token: str) -> bool:
+        now = _now()
+        with self._lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = self._db.execute(
+                    """
+                    UPDATE rationale_captures
+                    SET status = 'completed', completed_at = ?, lease_expires_at = NULL,
+                        last_error = NULL
+                    WHERE entry_id = ? AND status = 'processing' AND claim_token = ?
+                    """,
+                    (now, entry_id, claim_token),
+                )
+                self._db.commit()
+            except Exception:
+                self._db.rollback()
+                raise
+            else:
+                return cursor.rowcount == 1
+
+    def release_rationale(self, entry_id: str, claim_token: str, error: str) -> bool:
+        now = _now()
+        with self._lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = self._db.execute(
+                    """
+                    UPDATE rationale_captures
+                    SET status = 'retryable', lease_expires_at = ?, last_error = ?
+                    WHERE entry_id = ? AND status = 'processing' AND claim_token = ?
+                    """,
+                    (now, error[:1000], entry_id, claim_token),
+                )
+                self._db.commit()
+            except Exception:
+                self._db.rollback()
+                raise
+            else:
+                return cursor.rowcount == 1
+
+    def list_rationales(
+        self,
+        *,
+        repo: str,
+        pr_number: int | None = None,
+        declared_by: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Enumerate stored rationales, oldest revision first, without the token.
+
+        ``claim_token`` is the capability to release or finalise somebody else's
+        claim, so it is excluded here for the same reason it is excluded from
+        :meth:`list_questions`: an enumeration surface is read by far more callers
+        than the single worker that already holds one. Whether a claim is held is
+        reported by ``status`` and ``lease_expires_at``.
+
+        Ordering is by revision, so a reader sees the sequence a declaration went
+        through rather than only its final word. Earlier revisions are not
+        discarded: an intent captured at the start of implementation is worth
+        keeping precisely because it is often the one a later revision contradicts.
+        """
+        if limit < 1 or limit > MAX_QUESTION_LIST_LIMIT:
+            raise ValueError(f"limit must be between 1 and {MAX_QUESTION_LIST_LIMIT}")
+        clauses = ["repo = ?"]
+        params: list[Any] = [repo]
+        if pr_number is not None:
+            clauses.append("pr_number = ?")
+            params.append(pr_number)
+        if declared_by is not None:
+            clauses.append("declared_by = ?")
+            params.append(declared_by)
+        params.append(limit)
+        with self._lock:
+            rows = self._db.execute(
+                f"""
+                SELECT entry_id, repo, pr_number, branch, declared_by, declared_model, source,
+                       revision, revises, rationale_text, status, completed_at
+                FROM rationale_captures
+                WHERE {" AND ".join(clauses)}
+                ORDER BY revision ASC, entry_id ASC
+                LIMIT ?
+                """,
+                tuple(params),
+            ).fetchall()
+        return [
+            {
+                "entry_id": str(row[0]),
+                "repo": str(row[1]),
+                "pr_number": row[2],
+                "branch": row[3],
+                "declared_by": str(row[4]),
+                "declared_model": row[5],
+                "source": str(row[6]),
+                "revision": int(row[7]),
+                "revises": row[8],
+                "rationale_text": str(row[9]),
+                "status": str(row[10]),
+                "completed_at": row[11],
+            }
+            for row in rows
+        ]
+
+
+class _AnswerLedger:
+    """Owns the answer_captures rows: answer claims and completions."""
+
+    def __init__(self, db: sqlite3.Connection, lock: threading.RLock) -> None:
+        self._db = db
+        self._lock = lock
+
+    def claim_answer(
+        self,
+        *,
+        parent_comment_id: int,
+        answer_comment_id: int,
+        repo: str,
+        pr_number: int,
+        question_id: str,
+        entry_id: str,
+    ) -> str | None:
+        now = datetime.now(UTC)
+        lease = now + ANSWER_LEASE
+        claim_token = secrets.token_urlsafe(32)
+        with self._lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                question = self._db.execute(
+                    """
+                    SELECT answered, repo, pr_number
+                    FROM questions WHERE question_id = ? AND identifier = ?
+                    """,
+                    (question_id, parent_comment_id),
+                ).fetchone()
+                if (
+                    question is None
+                    or question[0]
+                    or not isinstance(question[1], str)
+                    or question[1].casefold() != repo.casefold()
+                    or question[2] != pr_number
+                ):
+                    self._db.rollback()
+                    return None
+                row = self._db.execute(
+                    """
+                    SELECT parent_comment_id, question_id, entry_id, status, lease_expires_at
+                    FROM answer_captures WHERE answer_comment_id = ?
+                    """,
+                    (answer_comment_id,),
+                ).fetchone()
+                if row is not None:
+                    if (
+                        row[0] != parent_comment_id
+                        or row[1] != question_id
+                        or row[2] != entry_id
+                        or row[3] == "completed"
+                    ):
+                        self._db.rollback()
+                        return None
+                    if row[3] == "processing" and row[4] and row[4] > now.isoformat():
+                        self._db.rollback()
+                        return None
+                    self._db.execute(
+                        """
+                        UPDATE answer_captures
+                        SET status = 'processing', claimed_at = ?, lease_expires_at = ?,
+                            last_error = NULL, completed_at = NULL, claim_token = ?
+                        WHERE answer_comment_id = ?
+                        """,
+                        (
+                            now.isoformat(),
+                            lease.isoformat(),
+                            claim_token,
+                            answer_comment_id,
+                        ),
+                    )
+                else:
+                    self._db.execute(
+                        """
+                        INSERT INTO answer_captures (
+                            answer_comment_id, parent_comment_id, question_id, entry_id, status,
+                            claimed_at, lease_expires_at, last_error, completed_at, claim_token
+                        ) VALUES (?, ?, ?, ?, 'processing', ?, ?, NULL, NULL, ?)
+                        """,
+                        (
+                            answer_comment_id,
+                            parent_comment_id,
+                            question_id,
+                            entry_id,
+                            now.isoformat(),
+                            lease.isoformat(),
+                            claim_token,
+                        ),
+                    )
+                self._db.commit()
+            except sqlite3.IntegrityError:
+                self._db.rollback()
+                return None
+            except Exception:
+                self._db.rollback()
+                raise
+        return claim_token
+
+    def complete_answer(self, answer_comment_id: int, claim_token: str) -> bool:
+        with self._lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._db.execute(
+                    """
+                    SELECT parent_comment_id
+                    FROM answer_captures
+                    WHERE answer_comment_id = ?
+                      AND status = 'processing'
+                      AND claim_token = ?
+                    """,
+                    (answer_comment_id, claim_token),
+                ).fetchone()
+                if row is None:
+                    self._db.rollback()
+                    return False
+                now = _now()
+                updated = self._db.execute(
+                    """
+                    UPDATE answer_captures
+                    SET status = 'completed', completed_at = ?, lease_expires_at = ?
+                    WHERE answer_comment_id = ?
+                      AND status = 'processing'
+                      AND claim_token = ?
+                    """,
+                    (now, now, answer_comment_id, claim_token),
+                )
+                if updated.rowcount != 1:
+                    self._db.rollback()
+                    return False
+                # The dedupe gate. Keyed on `status` rather than the legacy
+                # `answered` column so the queue and the gate can never disagree
+                # about whether an answer was already captured; rowcount == 1 is
+                # what makes this safe under concurrency, since a second writer
+                # for the same parent finds no un-answered row to update.
+                answered = self._db.execute(
+                    """
+                    UPDATE questions
+                    SET answered = 1, answer_comment_id = ?, status = 'answered',
+                        answered_at = ?, claim_token = NULL, claimed_at = NULL,
+                        lease_expires_at = NULL, updated_at = ?
+                    WHERE identifier = ? AND status <> 'answered'
+                    """,
+                    (answer_comment_id, now, now, row[0]),
+                )
+                if answered.rowcount != 1:
+                    self._db.rollback()
+                    return False
+                self._db.commit()
+            except Exception:
+                self._db.rollback()
+                raise
+            else:
+                return True
+
+    def release_answer(self, answer_comment_id: int, claim_token: str) -> bool:
+        with self._lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = self._db.execute(
+                    """
+                    DELETE FROM answer_captures
+                    WHERE answer_comment_id = ?
+                      AND status = 'processing'
+                      AND claim_token = ?
+                    """,
+                    (answer_comment_id, claim_token),
+                )
+                self._db.commit()
+            except Exception:
+                self._db.rollback()
+                raise
+            else:
+                return cursor.rowcount == 1
+
+
+class _PrStateLedger:
+    """Owns the pr_state_changes rows: lifecycle transitions."""
+
+    def __init__(self, db: sqlite3.Connection, lock: threading.RLock) -> None:
+        self._db = db
+        self._lock = lock
+
+    def claim_pr_state_change(
+        self, repo: str, pr_number: int, action: str, event_id: str | None = None
+    ) -> str | None:
+        key = event_id or f"legacy:{repo}:{pr_number}:{action}"
+        now = datetime.now(UTC)
+        lease = now + PR_EVENT_LEASE
+        claim_token = secrets.token_urlsafe(32)
+        with self._lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._db.execute(
+                    """
+                    SELECT repo, pr_number, action, status, lease_expires_at
+                    FROM pr_state_changes WHERE event_id = ?
+                    """,
+                    (key,),
+                ).fetchone()
+                if row is not None:
+                    if row[0] != repo or row[1] != pr_number or row[2] != action:
+                        self._db.rollback()
+                        return None
+                    if row[3] == "completed":
+                        self._db.rollback()
+                        return None
+                    if row[3] == "processing" and row[4] and row[4] > now.isoformat():
+                        self._db.rollback()
+                        return None
+                    self._db.execute(
+                        """
+                        UPDATE pr_state_changes
+                        SET status = 'processing', claimed_at = ?, lease_expires_at = ?,
+                            last_error = NULL, completed_at = NULL, claim_token = ?
+                        WHERE event_id = ?
+                        """,
+                        (now.isoformat(), lease.isoformat(), claim_token, key),
+                    )
+                else:
+                    self._db.execute(
+                        """
+                        INSERT INTO pr_state_changes (
+                            event_id, repo, pr_number, action, created_at, status,
+                            claimed_at, lease_expires_at, last_error, completed_at, claim_token
+                        ) VALUES (?, ?, ?, ?, ?, 'processing', ?, ?, NULL, NULL, ?)
+                        """,
+                        (
+                            key,
+                            repo,
+                            pr_number,
+                            action,
+                            now.isoformat(),
+                            now.isoformat(),
+                            lease.isoformat(),
+                            claim_token,
+                        ),
+                    )
+                self._db.commit()
+            except sqlite3.IntegrityError:
+                self._db.rollback()
+                return None
+            except Exception:
+                self._db.rollback()
+                raise
+        return claim_token
+
+    def complete_pr_state_change(self, event_id: str, claim_token: str) -> bool:
+        now = _now()
+        with self._lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = self._db.execute(
+                    """
+                    UPDATE pr_state_changes
+                    SET status = 'completed', completed_at = ?, lease_expires_at = NULL,
+                        last_error = NULL
+                    WHERE event_id = ? AND status = 'processing' AND claim_token = ?
+                    """,
+                    (now, event_id, claim_token),
+                )
+                self._db.commit()
+            except Exception:
+                self._db.rollback()
+                raise
+            else:
+                return cursor.rowcount == 1
+
+    def release_pr_state_change(self, event_id: str, claim_token: str, error: str) -> bool:
+        now = _now()
+        with self._lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = self._db.execute(
+                    """
+                    UPDATE pr_state_changes
+                    SET status = 'retryable', lease_expires_at = ?, last_error = ?
+                    WHERE event_id = ? AND status = 'processing' AND claim_token = ?
+                    """,
+                    (now, error[:1000], event_id, claim_token),
+                )
+                self._db.commit()
+            except Exception:
+                self._db.rollback()
+                raise
+            else:
+                return cursor.rowcount == 1
+
+    def pr_state_change_seen(
+        self, repo: str, pr_number: int, action: str, event_id: str | None = None
+    ) -> bool:
+        with self._lock:
+            if event_id is None:
+                row = self._db.execute(
+                    """
+                    SELECT 1 FROM pr_state_changes
+                    WHERE repo = ? AND pr_number = ? AND action = ?
+                    LIMIT 1
+                    """,
+                    (repo, pr_number, action),
+                ).fetchone()
+            else:
+                row = self._db.execute(
+                    "SELECT 1 FROM pr_state_changes WHERE event_id = ?", (event_id,)
+                ).fetchone()
+        return row is not None
+
+    def mark_pr_state_change(
+        self, repo: str, pr_number: int, action: str, event_id: str | None = None
+    ) -> None:
+        key = event_id or f"legacy:{repo}:{pr_number}:{action}"
+        now = _now()
+        with self._lock:
+            if event_id is None:
+                existing = self._db.execute(
+                    """
+                    SELECT 1 FROM pr_state_changes
+                    WHERE repo = ? AND pr_number = ? AND action = ?
+                    LIMIT 1
+                    """,
+                    (repo, pr_number, action),
+                ).fetchone()
+                if existing is not None:
+                    return
+            self._db.execute(
+                """
+                INSERT OR IGNORE INTO pr_state_changes (
+                    event_id, repo, pr_number, action, created_at, status,
+                    completed_at
+                ) VALUES (?, ?, ?, ?, ?, 'completed', ?)
+                """,
+                (key, repo, pr_number, action, now, now),
+            )
+            self._db.commit()
+
+
+class SqliteQuestionRegistry:
+    """SQLite-backed :class:`QuestionRegistry`."""
+
+    def __init__(self, path: str | Path) -> None:
+        self.path = Path(path).expanduser()
+        parent_created = not self.path.parent.exists()
+        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if parent_created:
+            self.path.parent.chmod(0o700)
+        self._secure_database_file()
+        self._db = sqlite3.connect(str(self.path), check_same_thread=False, timeout=5.0)
+        self._lock = threading.RLock()
+        self._deliveries = _DeliveryLedger(self._db, self._lock)
+        self._reviews = _ReviewLedger(self._db, self._lock)
+        self._rationales = _RationaleLedger(self._db, self._lock)
+        self._answers = _AnswerLedger(self._db, self._lock)
+        self._pr_states = _PrStateLedger(self._db, self._lock)
+        try:
+            configure_durable_connection(self._db)
+            self._db.executescript(_SCHEMA)
+            _migrate_schema(self._db)
+        except Exception:
+            self._db.close()
+            raise
+
+    def _secure_database_file(self) -> None:
+        flags = os.O_CREAT | os.O_RDWR
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(self.path, flags, 0o600)
+        try:
+            file_stat = os.fstat(descriptor)
+            if not stat.S_ISREG(file_stat.st_mode):
+                raise PermissionError("Question registry path must be a regular file")
+            if hasattr(os, "geteuid") and file_stat.st_uid != os.geteuid():
+                raise PermissionError("Question registry file must be owned by the current user")
+            os.fchmod(descriptor, 0o600)
+        finally:
+            os.close(descriptor)
+
+    def cleanup_deliveries(
+        self, retention_days: int = DELIVERY_RETENTION_DAYS, *, limit: int = 1_000
+    ) -> int:
+        return self._deliveries.cleanup_deliveries(retention_days=retention_days, limit=limit)
 
     def close(self) -> None:
         with self._lock:
@@ -719,86 +1607,15 @@ class SqliteQuestionRegistry:
         kind: str,
         author: str | None,
     ) -> str | None:
-        """Take a lease on one review record, or ``None`` if it is already captured.
-
-        Deduplication has two independent keys here. ``review_event_id`` is the
-        semantic identity, so a redelivered or re-serialised event collapses to one
-        record. ``comment_id`` is separately unique-indexed, which closes the gap
-        where the same inline comment arrives under two different review payload
-        shapes: the second insert hits the unique index and is refused rather than
-        producing a duplicate entry.
-        """
-        if not review_event_id:
-            raise ValueError("review_event_id must not be empty")
-        now = datetime.now(UTC)
-        lease = now + PR_EVENT_LEASE
-        claim_token = secrets.token_urlsafe(32)
-        with self._lock:
-            self._db.execute("BEGIN IMMEDIATE")
-            try:
-                row = self._db.execute(
-                    """
-                    SELECT repo, pr_number, review_id, comment_id, kind, status, lease_expires_at
-                    FROM review_captures WHERE review_event_id = ?
-                    """,
-                    (review_event_id,),
-                ).fetchone()
-                if row is not None:
-                    if (row[0], row[1], row[2], row[3], row[4]) != (
-                        repo,
-                        pr_number,
-                        review_id,
-                        comment_id,
-                        kind,
-                    ):
-                        self._db.rollback()
-                        return None
-                    if row[5] == "completed":
-                        self._db.rollback()
-                        return None
-                    if row[5] == "processing" and row[6] and row[6] > now.isoformat():
-                        self._db.rollback()
-                        return None
-                    self._db.execute(
-                        """
-                        UPDATE review_captures
-                        SET status = 'processing', claimed_at = ?, lease_expires_at = ?,
-                            last_error = NULL, completed_at = NULL, claim_token = ?
-                        WHERE review_event_id = ?
-                        """,
-                        (now.isoformat(), lease.isoformat(), claim_token, review_event_id),
-                    )
-                else:
-                    self._db.execute(
-                        """
-                        INSERT INTO review_captures (
-                            review_event_id, repo, pr_number, review_id, comment_id, kind,
-                            author, status, claimed_at, lease_expires_at, last_error,
-                            completed_at, claim_token
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'processing', ?, ?, NULL, NULL, ?)
-                        """,
-                        (
-                            review_event_id,
-                            repo,
-                            pr_number,
-                            review_id,
-                            comment_id,
-                            kind,
-                            author,
-                            now.isoformat(),
-                            lease.isoformat(),
-                            claim_token,
-                        ),
-                    )
-                self._db.commit()
-            except sqlite3.IntegrityError:
-                # A comment already captured under a different event identity.
-                self._db.rollback()
-                return None
-            except Exception:
-                self._db.rollback()
-                raise
-        return claim_token
+        return self._reviews.claim_review_capture(
+            review_event_id=review_event_id,
+            repo=repo,
+            pr_number=pr_number,
+            review_id=review_id,
+            comment_id=comment_id,
+            kind=kind,
+            author=author,
+        )
 
     def claim_rationale(
         self,
@@ -814,141 +1631,26 @@ class SqliteQuestionRegistry:
         revises: str | None,
         rationale_text: str,
     ) -> str | None:
-        """Take a lease on one declared rationale, or ``None`` if already captured.
-
-        Deduplication has two independent keys, mirroring
-        :meth:`claim_review_capture`. ``entry_id`` is the semantic identity derived
-        from the anchor, so a re-delivery collapses to one record. The unique index
-        over ``(repo, pr_number, branch, declared_by, revision)`` closes the gap
-        where the same declaration arrives under two different derived ids: the
-        second insert hits the index and is refused rather than storing the same
-        statement twice.
-
-        A claim whose lease has expired may be taken again, and the previous
-        holder's ``claim_token`` stops working at that moment, so a crashed
-        collector cannot be completed by a caller that no longer holds the work.
-        """
-        if not entry_id:
-            raise ValueError("entry_id must not be empty")
-        now = datetime.now(UTC)
-        lease = now + RATIONALE_LEASE
-        claim_token = secrets.token_urlsafe(32)
-        with self._lock:
-            self._db.execute("BEGIN IMMEDIATE")
-            try:
-                row = self._db.execute(
-                    """
-                    SELECT repo, pr_number, branch, declared_by, source, revision, revises,
-                           status, lease_expires_at
-                    FROM rationale_captures WHERE entry_id = ?
-                    """,
-                    (entry_id,),
-                ).fetchone()
-                if row is not None:
-                    if (row[0], row[1], row[2], row[3], row[4], row[5], row[6]) != (
-                        repo,
-                        pr_number,
-                        branch,
-                        declared_by,
-                        source,
-                        revision,
-                        revises,
-                    ):
-                        # The same id now describes something else, which means the
-                        # derivation moved. Refuse rather than overwrite a stored
-                        # record with a different one.
-                        self._db.rollback()
-                        return None
-                    if row[7] == "completed":
-                        self._db.rollback()
-                        return None
-                    if row[7] == "processing" and row[8] and row[8] > now.isoformat():
-                        self._db.rollback()
-                        return None
-                    self._db.execute(
-                        """
-                        UPDATE rationale_captures
-                        SET status = 'processing', claimed_at = ?, lease_expires_at = ?,
-                            last_error = NULL, completed_at = NULL, claim_token = ?
-                        WHERE entry_id = ?
-                        """,
-                        (now.isoformat(), lease.isoformat(), claim_token, entry_id),
-                    )
-                else:
-                    self._db.execute(
-                        """
-                        INSERT INTO rationale_captures (
-                            entry_id, repo, pr_number, branch, declared_by, declared_model,
-                            source, revision, revises, rationale_text, status, claimed_at,
-                            lease_expires_at, last_error, completed_at, claim_token
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'processing', ?, ?, NULL, NULL, ?)
-                        """,
-                        (
-                            entry_id,
-                            repo,
-                            pr_number,
-                            branch,
-                            declared_by,
-                            declared_model,
-                            source,
-                            revision,
-                            revises,
-                            rationale_text,
-                            now.isoformat(),
-                            lease.isoformat(),
-                            claim_token,
-                        ),
-                    )
-                self._db.commit()
-            except sqlite3.IntegrityError:
-                # A declaration already captured under a different derived id.
-                self._db.rollback()
-                return None
-            except Exception:
-                self._db.rollback()
-                raise
-        return claim_token
+        return self._rationales.claim_rationale(
+            entry_id=entry_id,
+            repo=repo,
+            pr_number=pr_number,
+            branch=branch,
+            declared_by=declared_by,
+            declared_model=declared_model,
+            source=source,
+            revision=revision,
+            revises=revises,
+            rationale_text=rationale_text,
+        )
 
     def complete_rationale(self, entry_id: str, claim_token: str) -> bool:
-        now = _now()
-        with self._lock:
-            self._db.execute("BEGIN IMMEDIATE")
-            try:
-                cursor = self._db.execute(
-                    """
-                    UPDATE rationale_captures
-                    SET status = 'completed', completed_at = ?, lease_expires_at = NULL,
-                        last_error = NULL
-                    WHERE entry_id = ? AND status = 'processing' AND claim_token = ?
-                    """,
-                    (now, entry_id, claim_token),
-                )
-                self._db.commit()
-            except Exception:
-                self._db.rollback()
-                raise
-            else:
-                return cursor.rowcount == 1
+        return self._rationales.complete_rationale(entry_id=entry_id, claim_token=claim_token)
 
     def release_rationale(self, entry_id: str, claim_token: str, error: str) -> bool:
-        now = _now()
-        with self._lock:
-            self._db.execute("BEGIN IMMEDIATE")
-            try:
-                cursor = self._db.execute(
-                    """
-                    UPDATE rationale_captures
-                    SET status = 'retryable', lease_expires_at = ?, last_error = ?
-                    WHERE entry_id = ? AND status = 'processing' AND claim_token = ?
-                    """,
-                    (now, error[:1000], entry_id, claim_token),
-                )
-                self._db.commit()
-            except Exception:
-                self._db.rollback()
-                raise
-            else:
-                return cursor.rowcount == 1
+        return self._rationales.release_rationale(
+            entry_id=entry_id, claim_token=claim_token, error=error
+        )
 
     def list_rationales(
         self,
@@ -958,59 +1660,9 @@ class SqliteQuestionRegistry:
         declared_by: str | None = None,
         limit: int = 100,
     ) -> list[dict[str, Any]]:
-        """Enumerate stored rationales, oldest revision first, without the token.
-
-        ``claim_token`` is the capability to release or finalise somebody else's
-        claim, so it is excluded here for the same reason it is excluded from
-        :meth:`list_questions`: an enumeration surface is read by far more callers
-        than the single worker that already holds one. Whether a claim is held is
-        reported by ``status`` and ``lease_expires_at``.
-
-        Ordering is by revision, so a reader sees the sequence a declaration went
-        through rather than only its final word. Earlier revisions are not
-        discarded: an intent captured at the start of implementation is worth
-        keeping precisely because it is often the one a later revision contradicts.
-        """
-        if limit < 1 or limit > MAX_QUESTION_LIST_LIMIT:
-            raise ValueError(f"limit must be between 1 and {MAX_QUESTION_LIST_LIMIT}")
-        clauses = ["repo = ?"]
-        params: list[Any] = [repo]
-        if pr_number is not None:
-            clauses.append("pr_number = ?")
-            params.append(pr_number)
-        if declared_by is not None:
-            clauses.append("declared_by = ?")
-            params.append(declared_by)
-        params.append(limit)
-        with self._lock:
-            rows = self._db.execute(
-                f"""
-                SELECT entry_id, repo, pr_number, branch, declared_by, declared_model, source,
-                       revision, revises, rationale_text, status, completed_at
-                FROM rationale_captures
-                WHERE {" AND ".join(clauses)}
-                ORDER BY revision ASC, entry_id ASC
-                LIMIT ?
-                """,
-                tuple(params),
-            ).fetchall()
-        return [
-            {
-                "entry_id": str(row[0]),
-                "repo": str(row[1]),
-                "pr_number": row[2],
-                "branch": row[3],
-                "declared_by": str(row[4]),
-                "declared_model": row[5],
-                "source": str(row[6]),
-                "revision": int(row[7]),
-                "revises": row[8],
-                "rationale_text": str(row[9]),
-                "status": str(row[10]),
-                "completed_at": row[11],
-            }
-            for row in rows
-        ]
+        return self._rationales.list_rationales(
+            repo=repo, pr_number=pr_number, declared_by=declared_by, limit=limit
+        )
 
     def supersede_questions_for_pr(
         self, repo: str, pr_number: int, head_sha: str | None = None
@@ -1060,45 +1712,14 @@ class SqliteQuestionRegistry:
                 return cursor.rowcount
 
     def complete_review_capture(self, review_event_id: str, claim_token: str) -> bool:
-        now = _now()
-        with self._lock:
-            self._db.execute("BEGIN IMMEDIATE")
-            try:
-                cursor = self._db.execute(
-                    """
-                    UPDATE review_captures
-                    SET status = 'completed', completed_at = ?, lease_expires_at = NULL,
-                        last_error = NULL
-                    WHERE review_event_id = ? AND status = 'processing' AND claim_token = ?
-                    """,
-                    (now, review_event_id, claim_token),
-                )
-                self._db.commit()
-            except Exception:
-                self._db.rollback()
-                raise
-            else:
-                return cursor.rowcount == 1
+        return self._reviews.complete_review_capture(
+            review_event_id=review_event_id, claim_token=claim_token
+        )
 
     def release_review_capture(self, review_event_id: str, claim_token: str, error: str) -> bool:
-        now = _now()
-        with self._lock:
-            self._db.execute("BEGIN IMMEDIATE")
-            try:
-                cursor = self._db.execute(
-                    """
-                    UPDATE review_captures
-                    SET status = 'retryable', lease_expires_at = ?, last_error = ?
-                    WHERE review_event_id = ? AND status = 'processing' AND claim_token = ?
-                    """,
-                    (now, error[:1000], review_event_id, claim_token),
-                )
-                self._db.commit()
-            except Exception:
-                self._db.rollback()
-                raise
-            else:
-                return cursor.rowcount == 1
+        return self._reviews.release_review_capture(
+            review_event_id=review_event_id, claim_token=claim_token, error=error
+        )
 
     def claim_answer(
         self,
@@ -1110,163 +1731,24 @@ class SqliteQuestionRegistry:
         question_id: str,
         entry_id: str,
     ) -> str | None:
-        now = datetime.now(UTC)
-        lease = now + ANSWER_LEASE
-        claim_token = secrets.token_urlsafe(32)
-        with self._lock:
-            self._db.execute("BEGIN IMMEDIATE")
-            try:
-                question = self._db.execute(
-                    """
-                    SELECT answered, repo, pr_number
-                    FROM questions WHERE question_id = ? AND identifier = ?
-                    """,
-                    (question_id, parent_comment_id),
-                ).fetchone()
-                if (
-                    question is None
-                    or question[0]
-                    or not isinstance(question[1], str)
-                    or question[1].casefold() != repo.casefold()
-                    or question[2] != pr_number
-                ):
-                    self._db.rollback()
-                    return None
-                row = self._db.execute(
-                    """
-                    SELECT parent_comment_id, question_id, entry_id, status, lease_expires_at
-                    FROM answer_captures WHERE answer_comment_id = ?
-                    """,
-                    (answer_comment_id,),
-                ).fetchone()
-                if row is not None:
-                    if (
-                        row[0] != parent_comment_id
-                        or row[1] != question_id
-                        or row[2] != entry_id
-                        or row[3] == "completed"
-                    ):
-                        self._db.rollback()
-                        return None
-                    if row[3] == "processing" and row[4] and row[4] > now.isoformat():
-                        self._db.rollback()
-                        return None
-                    self._db.execute(
-                        """
-                        UPDATE answer_captures
-                        SET status = 'processing', claimed_at = ?, lease_expires_at = ?,
-                            last_error = NULL, completed_at = NULL, claim_token = ?
-                        WHERE answer_comment_id = ?
-                        """,
-                        (
-                            now.isoformat(),
-                            lease.isoformat(),
-                            claim_token,
-                            answer_comment_id,
-                        ),
-                    )
-                else:
-                    self._db.execute(
-                        """
-                        INSERT INTO answer_captures (
-                            answer_comment_id, parent_comment_id, question_id, entry_id, status,
-                            claimed_at, lease_expires_at, last_error, completed_at, claim_token
-                        ) VALUES (?, ?, ?, ?, 'processing', ?, ?, NULL, NULL, ?)
-                        """,
-                        (
-                            answer_comment_id,
-                            parent_comment_id,
-                            question_id,
-                            entry_id,
-                            now.isoformat(),
-                            lease.isoformat(),
-                            claim_token,
-                        ),
-                    )
-                self._db.commit()
-            except sqlite3.IntegrityError:
-                self._db.rollback()
-                return None
-            except Exception:
-                self._db.rollback()
-                raise
-        return claim_token
+        return self._answers.claim_answer(
+            parent_comment_id=parent_comment_id,
+            answer_comment_id=answer_comment_id,
+            repo=repo,
+            pr_number=pr_number,
+            question_id=question_id,
+            entry_id=entry_id,
+        )
 
     def complete_answer(self, answer_comment_id: int, claim_token: str) -> bool:
-        with self._lock:
-            self._db.execute("BEGIN IMMEDIATE")
-            try:
-                row = self._db.execute(
-                    """
-                    SELECT parent_comment_id
-                    FROM answer_captures
-                    WHERE answer_comment_id = ?
-                      AND status = 'processing'
-                      AND claim_token = ?
-                    """,
-                    (answer_comment_id, claim_token),
-                ).fetchone()
-                if row is None:
-                    self._db.rollback()
-                    return False
-                now = _now()
-                updated = self._db.execute(
-                    """
-                    UPDATE answer_captures
-                    SET status = 'completed', completed_at = ?, lease_expires_at = ?
-                    WHERE answer_comment_id = ?
-                      AND status = 'processing'
-                      AND claim_token = ?
-                    """,
-                    (now, now, answer_comment_id, claim_token),
-                )
-                if updated.rowcount != 1:
-                    self._db.rollback()
-                    return False
-                # The dedupe gate. Keyed on `status` rather than the legacy
-                # `answered` column so the queue and the gate can never disagree
-                # about whether an answer was already captured; rowcount == 1 is
-                # what makes this safe under concurrency, since a second writer
-                # for the same parent finds no un-answered row to update.
-                answered = self._db.execute(
-                    """
-                    UPDATE questions
-                    SET answered = 1, answer_comment_id = ?, status = 'answered',
-                        answered_at = ?, claim_token = NULL, claimed_at = NULL,
-                        lease_expires_at = NULL, updated_at = ?
-                    WHERE identifier = ? AND status <> 'answered'
-                    """,
-                    (answer_comment_id, now, now, row[0]),
-                )
-                if answered.rowcount != 1:
-                    self._db.rollback()
-                    return False
-                self._db.commit()
-            except Exception:
-                self._db.rollback()
-                raise
-            else:
-                return True
+        return self._answers.complete_answer(
+            answer_comment_id=answer_comment_id, claim_token=claim_token
+        )
 
     def release_answer(self, answer_comment_id: int, claim_token: str) -> bool:
-        with self._lock:
-            self._db.execute("BEGIN IMMEDIATE")
-            try:
-                cursor = self._db.execute(
-                    """
-                    DELETE FROM answer_captures
-                    WHERE answer_comment_id = ?
-                      AND status = 'processing'
-                      AND claim_token = ?
-                    """,
-                    (answer_comment_id, claim_token),
-                )
-                self._db.commit()
-            except Exception:
-                self._db.rollback()
-                raise
-            else:
-                return cursor.rowcount == 1
+        return self._answers.release_answer(
+            answer_comment_id=answer_comment_id, claim_token=claim_token
+        )
 
     def update_question_status(
         self, github_comment_id: int, status: str, error_message: str | None = None
@@ -1330,154 +1812,31 @@ class SqliteQuestionRegistry:
     def pr_state_change_seen(
         self, repo: str, pr_number: int, action: str, event_id: str | None = None
     ) -> bool:
-        with self._lock:
-            if event_id is None:
-                row = self._db.execute(
-                    """
-                    SELECT 1 FROM pr_state_changes
-                    WHERE repo = ? AND pr_number = ? AND action = ?
-                    LIMIT 1
-                    """,
-                    (repo, pr_number, action),
-                ).fetchone()
-            else:
-                row = self._db.execute(
-                    "SELECT 1 FROM pr_state_changes WHERE event_id = ?", (event_id,)
-                ).fetchone()
-        return row is not None
+        return self._pr_states.pr_state_change_seen(
+            repo=repo, pr_number=pr_number, action=action, event_id=event_id
+        )
 
     def mark_pr_state_change(
         self, repo: str, pr_number: int, action: str, event_id: str | None = None
     ) -> None:
-        key = event_id or f"legacy:{repo}:{pr_number}:{action}"
-        now = _now()
-        with self._lock:
-            if event_id is None:
-                existing = self._db.execute(
-                    """
-                    SELECT 1 FROM pr_state_changes
-                    WHERE repo = ? AND pr_number = ? AND action = ?
-                    LIMIT 1
-                    """,
-                    (repo, pr_number, action),
-                ).fetchone()
-                if existing is not None:
-                    return
-            self._db.execute(
-                """
-                INSERT OR IGNORE INTO pr_state_changes (
-                    event_id, repo, pr_number, action, created_at, status,
-                    completed_at
-                ) VALUES (?, ?, ?, ?, ?, 'completed', ?)
-                """,
-                (key, repo, pr_number, action, now, now),
-            )
-            self._db.commit()
+        return self._pr_states.mark_pr_state_change(
+            repo=repo, pr_number=pr_number, action=action, event_id=event_id
+        )
 
     def claim_pr_state_change(
         self, repo: str, pr_number: int, action: str, event_id: str | None = None
     ) -> str | None:
-        key = event_id or f"legacy:{repo}:{pr_number}:{action}"
-        now = datetime.now(UTC)
-        lease = now + PR_EVENT_LEASE
-        claim_token = secrets.token_urlsafe(32)
-        with self._lock:
-            self._db.execute("BEGIN IMMEDIATE")
-            try:
-                row = self._db.execute(
-                    """
-                    SELECT repo, pr_number, action, status, lease_expires_at
-                    FROM pr_state_changes WHERE event_id = ?
-                    """,
-                    (key,),
-                ).fetchone()
-                if row is not None:
-                    if row[0] != repo or row[1] != pr_number or row[2] != action:
-                        self._db.rollback()
-                        return None
-                    if row[3] == "completed":
-                        self._db.rollback()
-                        return None
-                    if row[3] == "processing" and row[4] and row[4] > now.isoformat():
-                        self._db.rollback()
-                        return None
-                    self._db.execute(
-                        """
-                        UPDATE pr_state_changes
-                        SET status = 'processing', claimed_at = ?, lease_expires_at = ?,
-                            last_error = NULL, completed_at = NULL, claim_token = ?
-                        WHERE event_id = ?
-                        """,
-                        (now.isoformat(), lease.isoformat(), claim_token, key),
-                    )
-                else:
-                    self._db.execute(
-                        """
-                        INSERT INTO pr_state_changes (
-                            event_id, repo, pr_number, action, created_at, status,
-                            claimed_at, lease_expires_at, last_error, completed_at, claim_token
-                        ) VALUES (?, ?, ?, ?, ?, 'processing', ?, ?, NULL, NULL, ?)
-                        """,
-                        (
-                            key,
-                            repo,
-                            pr_number,
-                            action,
-                            now.isoformat(),
-                            now.isoformat(),
-                            lease.isoformat(),
-                            claim_token,
-                        ),
-                    )
-                self._db.commit()
-            except sqlite3.IntegrityError:
-                self._db.rollback()
-                return None
-            except Exception:
-                self._db.rollback()
-                raise
-        return claim_token
+        return self._pr_states.claim_pr_state_change(
+            repo=repo, pr_number=pr_number, action=action, event_id=event_id
+        )
 
     def complete_pr_state_change(self, event_id: str, claim_token: str) -> bool:
-        now = _now()
-        with self._lock:
-            self._db.execute("BEGIN IMMEDIATE")
-            try:
-                cursor = self._db.execute(
-                    """
-                    UPDATE pr_state_changes
-                    SET status = 'completed', completed_at = ?, lease_expires_at = NULL,
-                        last_error = NULL
-                    WHERE event_id = ? AND status = 'processing' AND claim_token = ?
-                    """,
-                    (now, event_id, claim_token),
-                )
-                self._db.commit()
-            except Exception:
-                self._db.rollback()
-                raise
-            else:
-                return cursor.rowcount == 1
+        return self._pr_states.complete_pr_state_change(event_id=event_id, claim_token=claim_token)
 
     def release_pr_state_change(self, event_id: str, claim_token: str, error: str) -> bool:
-        now = _now()
-        with self._lock:
-            self._db.execute("BEGIN IMMEDIATE")
-            try:
-                cursor = self._db.execute(
-                    """
-                    UPDATE pr_state_changes
-                    SET status = 'retryable', lease_expires_at = ?, last_error = ?
-                    WHERE event_id = ? AND status = 'processing' AND claim_token = ?
-                    """,
-                    (now, error[:1000], event_id, claim_token),
-                )
-                self._db.commit()
-            except Exception:
-                self._db.rollback()
-                raise
-            else:
-                return cursor.rowcount == 1
+        return self._pr_states.release_pr_state_change(
+            event_id=event_id, claim_token=claim_token, error=error
+        )
 
     @staticmethod
     def _backfill_repo_key(repo: str) -> str:
@@ -1556,110 +1915,17 @@ class SqliteQuestionRegistry:
     def claim_delivery(
         self, delivery_id: str, repo: str, event: str, payload_hash: str
     ) -> DeliveryClaim:
-        now = datetime.now(UTC)
-        lease = now + DELIVERY_LEASE
-        claim_token = secrets.token_urlsafe(32)
-        with self._lock:
-            self._db.execute("BEGIN IMMEDIATE")
-            try:
-                row = self._db.execute(
-                    """
-                    SELECT repo, event, payload_hash, status, lease_expires_at
-                    FROM webhook_deliveries WHERE delivery_id = ?
-                    """,
-                    (delivery_id,),
-                ).fetchone()
-                if row is not None:
-                    if row[0] != repo or row[1] != event:
-                        self._db.rollback()
-                        return "conflict"
-                    if row[2] not in {"", payload_hash}:
-                        self._db.rollback()
-                        return "conflict"
-                    if row[3] == "completed":
-                        self._db.rollback()
-                        return "duplicate"
-                    if row[3] == "processing" and row[4] and row[4] > now.isoformat():
-                        self._db.rollback()
-                        return "active"
-                    self._db.execute(
-                        """
-                        UPDATE webhook_deliveries
-                        SET status = 'processing', claimed_at = ?, lease_expires_at = ?,
-                            last_error = NULL, completed_at = NULL, claim_token = ?
-                        WHERE delivery_id = ?
-                        """,
-                        (now.isoformat(), lease.isoformat(), claim_token, delivery_id),
-                    )
-                else:
-                    self._db.execute(
-                        """
-                        INSERT INTO webhook_deliveries (
-                            delivery_id, repo, event, payload_hash, status, claimed_at,
-                            lease_expires_at, last_error, completed_at, claim_token, created_at
-                        ) VALUES (?, ?, ?, ?, 'processing', ?, ?, NULL, NULL, ?, ?)
-                        """,
-                        (
-                            delivery_id,
-                            repo,
-                            event,
-                            payload_hash,
-                            now.isoformat(),
-                            lease.isoformat(),
-                            claim_token,
-                            now.isoformat(),
-                        ),
-                    )
-                self._db.commit()
-            except Exception:
-                self._db.rollback()
-                raise
-        return claim_token
+        return self._deliveries.claim_delivery(
+            delivery_id=delivery_id, repo=repo, event=event, payload_hash=payload_hash
+        )
 
     def complete_delivery(self, delivery_id: str, claim_token: str) -> bool:
-        now = _now()
-        with self._lock:
-            self._db.execute("BEGIN IMMEDIATE")
-            try:
-                cursor = self._db.execute(
-                    """
-                    UPDATE webhook_deliveries
-                    SET status = 'completed', completed_at = ?, lease_expires_at = NULL,
-                        last_error = NULL
-                    WHERE delivery_id = ?
-                      AND status = 'processing'
-                      AND claim_token = ?
-                    """,
-                    (now, delivery_id, claim_token),
-                )
-                self._db.commit()
-            except Exception:
-                self._db.rollback()
-                raise
-            else:
-                return cursor.rowcount == 1
+        return self._deliveries.complete_delivery(delivery_id=delivery_id, claim_token=claim_token)
 
     def release_delivery(self, delivery_id: str, claim_token: str, error: str) -> bool:
-        now = _now()
-        with self._lock:
-            self._db.execute("BEGIN IMMEDIATE")
-            try:
-                cursor = self._db.execute(
-                    """
-                    UPDATE webhook_deliveries
-                    SET status = 'retryable', lease_expires_at = ?, last_error = ?
-                    WHERE delivery_id = ?
-                      AND status = 'processing'
-                      AND claim_token = ?
-                    """,
-                    (now, error[:1000], delivery_id, claim_token),
-                )
-                self._db.commit()
-            except Exception:
-                self._db.rollback()
-                raise
-            else:
-                return cursor.rowcount == 1
+        return self._deliveries.release_delivery(
+            delivery_id=delivery_id, claim_token=claim_token, error=error
+        )
 
     def record_session(self, session: ReviewSession) -> None:
         with self._lock:

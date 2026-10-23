@@ -46,6 +46,7 @@ from multiprocessing.process import BaseProcess
 from pathlib import Path
 
 import pytest
+from tests.support import execute_write
 
 from kojutsu.core.outbox import TansekiOutbox
 from kojutsu.core.question_registry import SqliteQuestionRegistry
@@ -282,8 +283,7 @@ def test_a_killed_lease_holder_leaves_its_row_recoverable(tmp_path: Path) -> Non
         # The lease stands, so the row is not offered for delivery.
         assert outbox.ready() == []
 
-        outbox._db.execute("UPDATE outbox SET lease_expires_at = ?", (EXPIRED,))
-        outbox._db.commit()
+        execute_write(outbox.path, "UPDATE outbox SET lease_expires_at = ?", (EXPIRED,))
 
         claimed = outbox.claim_due(limit=10, lease_seconds=60)
         assert [item.entry_id for item in claimed] == ["e1"]
@@ -314,8 +314,7 @@ def test_a_crash_between_the_registry_claim_and_the_write_is_reconcilable(
         assert claimed[0]["attempts"] == 1
         assert outbox.pending_count() == 0, "nothing was written before the crash"
 
-        registry._db.execute("UPDATE questions SET lease_expires_at = ?", (EXPIRED,))
-        registry._db.commit()
+        execute_write(registry.path, "UPDATE questions SET lease_expires_at = ?", (EXPIRED,))
 
         assert registry.claim_question_for_answer("q1", "worker-2") is not None
         outbox.enqueue("answer-201", {"id": "answer-201"})
@@ -380,10 +379,11 @@ def test_a_kill_at_an_arbitrary_moment_leaves_a_consistent_outbox(
         assert set(outbox.status_counts()) == {"pending", "retrying", "dead_letter"}
 
         # Expire anything the dead writer had leased, as time would have.
-        outbox._db.execute(
-            "UPDATE outbox SET lease_expires_at = ?, next_attempt_at = ?", (EXPIRED, EXPIRED)
+        execute_write(
+            outbox.path,
+            "UPDATE outbox SET lease_expires_at = ?, next_attempt_at = ?",
+            (EXPIRED, EXPIRED),
         )
-        outbox._db.commit()
 
         drained = 0
         while True:

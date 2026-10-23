@@ -10,8 +10,9 @@ import unicodedata
 import uuid
 import warnings
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime
+from types import TracebackType
 from typing import Any, Generic, TypeVar
 from urllib.parse import urlsplit
 
@@ -937,6 +938,43 @@ class PullRequestSearch:
         return [pull.number for pull in self.pull_requests]
 
 
+@dataclass
+class _SearchWalk:
+    """Mutable accumulation state for one date-range page walk."""
+
+    cap: int
+    page_size: int
+    collected: list[GitHubPullRequest] = field(default_factory=list)
+    total_count: int = 0
+    incomplete_results: bool = False
+    out_of_range: int = 0
+    undated: int = 0
+    hits_seen: int = 0
+    pages_fetched: int = 0
+
+    def add_page(self, items: list[dict], start: date, end: date) -> None:
+        self.hits_seen += len(items)
+        for entry in items:
+            pull = GitHubPullRequest.model_validate(entry)
+            kept = _within_range(pull.created_at, start, end)
+            if kept is None:
+                # No creation date, so no way to show it is in range.
+                # Counting it is the alternative to pretending the filter
+                # was exact.
+                self.undated += 1
+                continue
+            if kept:
+                self.collected.append(pull)
+            else:
+                self.out_of_range += 1
+
+    def note_page(self, total_count: int, incomplete_results: bool) -> None:
+        """Fold one fetched page's envelope into the walk totals."""
+        self.pages_fetched += 1
+        self.total_count = total_count
+        self.incomplete_results = incomplete_results
+
+
 class GitHubClient:
     """Client for GitHub API: PR details, diff, and issue comments.
 
@@ -968,7 +1006,7 @@ class GitHubClient:
         base_url: str = "https://api.github.com",
         *,
         search_pace_seconds: float | None = None,
-        sleep: Callable[[float], None] = time.sleep,
+        sleep: Callable[[float], None] | None = None,
         rate_limit_retries: int = DEFAULT_GITHUB_REQUEST_RETRIES,
         max_backoff_seconds: float = MAX_GITHUB_BACKOFF_SECONDS,
     ) -> None:
@@ -989,7 +1027,7 @@ class GitHubClient:
         self._search_pace_seconds = (
             DEFAULT_SEARCH_PACE_SECONDS if search_pace_seconds is None else search_pace_seconds
         )
-        self._sleep = sleep
+        self._sleep = sleep if sleep is not None else time.sleep
         #: How many rate-limit/server-error responses are absorbed with a
         #: backoff before the response is returned for normal error handling.
         #: Injectable alongside ``sleep`` so a test can exhaust the policy
@@ -1033,7 +1071,12 @@ class GitHubClient:
     def __enter__(self) -> "GitHubClient":
         return self
 
-    def __exit__(self, *exc: object) -> None:
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
         self.close()
 
     def _url(self, path: str) -> str:
@@ -1189,6 +1232,11 @@ class GitHubClient:
             return
         raise GitHubTokenScopeError(message)
 
+    @property
+    def scope_checked(self) -> bool:
+        """Whether this client has verified the token scope against the forge."""
+        return self._scope_checked
+
     def get_authenticated_user(self) -> str:
         """Return the login authenticated by this client."""
         if self._authenticated_login is not None:
@@ -1319,16 +1367,27 @@ class GitHubClient:
         page_size = min(max(cap, 1), SEARCH_PAGE_SIZE)
         query = f"repo:{repository} is:pr created:{start.isoformat()}..{end.isoformat()}"
 
-        collected: list[GitHubPullRequest] = []
-        total_count = 0
-        incomplete_results = False
-        out_of_range = 0
-        undated = 0
-        hits_seen = 0
-        page = 1
-        pages_fetched = 0
-        deadline: float | None = None
+        walk = self._walk_search_results(query, page_size=page_size, cap=cap, start=start, end=end)
+        return PullRequestSearch(
+            pull_requests=walk.collected[:cap],
+            # Truncated is a claim about coverage, so it is measured against what
+            # the index *offered*, not against what survived the date filter: a
+            # filter rejecting a stale hit is the filter working, and calling that
+            # an incomplete read would train an operator to ignore the flag.
+            truncated=walk.incomplete_results or walk.hits_seen < walk.total_count,
+            total_count=walk.total_count,
+            out_of_range=walk.out_of_range,
+            undated=walk.undated,
+            pages_fetched=walk.pages_fetched,
+            hits_seen=walk.hits_seen,
+        )
 
+    def _walk_search_results(
+        self, query: str, *, page_size: int, cap: int, start: date, end: date
+    ) -> _SearchWalk:
+        walk = _SearchWalk(cap=cap, page_size=page_size)
+        page = 1
+        deadline: float | None = None
         while True:
             if deadline is not None:
                 self._pace(deadline)
@@ -1347,49 +1406,23 @@ class GitHubClient:
                 headers=self._headers,
             )
             self._verified(response)
-            pages_fetched += 1
             items, total_count, incomplete_results = self._search_page(response)
+            walk.note_page(total_count, incomplete_results)
             # An empty page ends the walk. GitHub can return one mid-sequence
             # when the index shifts under a paginated read, and the honest
             # response is to stop and report the shortfall -- not to keep
             # asking, which either loops or walks off the end of the index.
             if not items:
                 break
-            hits_seen += len(items)
-            for entry in items:
-                pull = GitHubPullRequest.model_validate(entry)
-                kept = _within_range(pull.created_at, start, end)
-                if kept is None:
-                    # No creation date, so no way to show it is in range.
-                    # Counting it is the alternative to pretending the filter
-                    # was exact.
-                    undated += 1
-                    continue
-                if kept:
-                    collected.append(pull)
-                else:
-                    out_of_range += 1
-            if len(collected) >= cap or len(items) < page_size:
+            walk.add_page(items, start, end)
+            if len(walk.collected) >= cap or len(items) < page_size:
                 break
             page += 1
             if page > SEARCH_RESULT_CAP // page_size:
                 # Off the end of what the cap can return, whatever the index
                 # says is there.
                 break
-
-        return PullRequestSearch(
-            pull_requests=collected[:cap],
-            # Truncated is a claim about coverage, so it is measured against what
-            # the index *offered*, not against what survived the date filter: a
-            # filter rejecting a stale hit is the filter working, and calling that
-            # an incomplete read would train an operator to ignore the flag.
-            truncated=incomplete_results or hits_seen < total_count,
-            total_count=total_count,
-            out_of_range=out_of_range,
-            undated=undated,
-            pages_fetched=pages_fetched,
-            hits_seen=hits_seen,
-        )
+        return walk
 
     def _pace(self, deadline: float) -> None:
         """Sleep until ``deadline`` if the last request beat the pace.

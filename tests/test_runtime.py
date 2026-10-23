@@ -64,7 +64,7 @@ def test_build_runtime_wires_dependencies(tmp_path: Path, monkeypatch: pytest.Mo
 
 
 def test_get_runtime_caches_and_reset(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(runtime_module, "_runtime", None)
+    runtime_module.install_runtime(None)
     monkeypatch.setenv("TANSEKI_URL", "https://tanseki.test")
     monkeypatch.setenv("TANSEKI_OUTBOX_PATH", str(tmp_path / "o.db"))
     monkeypatch.setenv("KOJUTSU_REGISTRY_PATH", str(tmp_path / "r.db"))
@@ -73,7 +73,7 @@ def test_get_runtime_caches_and_reset(tmp_path: Path, monkeypatch: pytest.Monkey
     assert get_runtime() is first
 
     reset_runtime()
-    assert runtime_module._runtime is None
+    assert runtime_module.install_runtime(None) is None
 
 
 def test_runtime_close_attempts_every_resource() -> None:
@@ -112,12 +112,12 @@ def test_reset_runtime_clears_cache_when_close_fails(
         def close(self) -> None:
             raise RuntimeError("close failed")
 
-    monkeypatch.setattr(runtime_module, "_runtime", cast(Any, FailingRuntime()))
+    runtime_module.install_runtime(cast(Any, FailingRuntime()))
 
     with pytest.raises(RuntimeError, match="close failed"):
         reset_runtime()
 
-    assert runtime_module._runtime is None
+    assert runtime_module.install_runtime(None) is None
 
 
 def test_reset_runtime_restores_cached_runtime_after_close_timeout(
@@ -133,14 +133,14 @@ def test_reset_runtime_restores_cached_runtime_after_close_timeout(
                 raise TimeoutError("still active")
 
     runtime = TimeoutRuntime()
-    monkeypatch.setattr(runtime_module, "_runtime", cast(Any, runtime))
+    runtime_module.install_runtime(cast(Any, runtime))
 
     with pytest.raises(TimeoutError, match="still active"):
         reset_runtime()
-    assert runtime_module._runtime is runtime
+    assert runtime_module.install_runtime(None) is runtime
 
     reset_runtime()
-    assert runtime_module._runtime is None
+    assert runtime_module.install_runtime(None) is None
 
 
 def test_build_runtime_closes_created_resources_on_composition_failure(

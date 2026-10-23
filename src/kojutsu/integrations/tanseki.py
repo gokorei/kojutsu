@@ -31,6 +31,7 @@ from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from email.utils import parsedate_to_datetime
+from types import TracebackType
 from typing import Any, Protocol, TypedDict, runtime_checkable
 from urllib.parse import urlparse
 
@@ -479,7 +480,7 @@ class TansekiClient:
         timeout: float = 10.0,
         max_retries: int = 2,
         client: httpx.Client | None = None,
-        sleep: Callable[[float], None] = time.sleep,
+        sleep: Callable[[float], None] | None = None,
         clock: Callable[[], float] = time.time,
         jitter: Callable[[], float] = random.random,
     ) -> None:
@@ -492,7 +493,7 @@ class TansekiClient:
         #: it. The arithmetic is the behaviour under test; a test that actually
         #: sleeps out a ``Retry-After`` is a test nobody runs and everybody
         #: disables.
-        self._sleep = sleep
+        self._sleep = sleep if sleep is not None else time.sleep
         #: Wall clock, used only to turn an HTTP-date ``Retry-After`` into a
         #: delay. Separate from ``sleep`` because the two answer different
         #: questions: one is "how long do I wait", the other "what time is it".
@@ -525,7 +526,12 @@ class TansekiClient:
     def __enter__(self) -> TansekiClient:
         return self
 
-    def __exit__(self, *exc: object) -> None:
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
         self.close()
 
     def close(self) -> None:

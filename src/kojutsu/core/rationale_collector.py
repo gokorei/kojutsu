@@ -136,6 +136,7 @@ from kojutsu.core.question_registry import (
 )
 from kojutsu.core.text_hygiene import SANITISATION_KEY, describe_removals, sanitise
 from kojutsu.integrations.github import (
+    RationaleClaim,
     extract_rationale_claim,
     extract_rationale_text_from_comment_body,
 )
@@ -185,57 +186,14 @@ def process_rationale_comment_outcome(
     The character policy is applied to the prose and nothing else; see the module
     docstring for why it applies here and why the marker's values are not touched.
     """
-    if len(comment_body) > MAX_RATIONALE_CHARS:
+    parsed = _parse_rationale_comment(comment_body, branch)
+    if parsed is None:
         return None
-    claim = extract_rationale_claim(comment_body)
-    if claim is None:
-        return None
+    claim, rationale_text, sanitisation_note, anchor_branch = parsed
     if not association_admitted(author_association, ADMIT_ALL_ASSOCIATIONS):
         return None
-
-    # Two passes, and neither is the other. The extractor is what *reads* the comment:
-    # it parses the ``kojutsu:`` grammar verbatim, so a mangled marker fails closed
-    # rather than being repaired into something this system did not write, and it
-    # normalises a marker's value. :func:`sanitise` is what *stores* the prose, applied
-    # here rather than inside the extractor because a removed character has to be
-    # reported and a function returning a string has nowhere to put that. The refused
-    # set is a superset of the extractor's, so nothing the narrower pass left behind
-    # survives this one -- measured against ``tests/fixtures/forged-agent-report.md``,
-    # what this seam adds is a BELL and two word joiners, which is what an answer
-    # captured from the same comment already could not have held.
-    #
-    # The note is measured against the delivered comment, not against the extracted
-    # prose: the extractor has already removed fourteen of the same characters and
-    # handed back a bare string, so a note computed from it would name only what this
-    # module took. That under-reports, and it under-reports in the one field whose
-    # whole job is to say what was done to the record. See
-    # :func:`kojutsu.core.text_hygiene.describe_removals`, which is the whole reason
-    # that function exists.
-    rationale_text = extract_rationale_text_from_comment_body(comment_body)
-    reason_field = sanitise(rationale_text)
-    rationale_text = reason_field.text
-    sanitisation_note = describe_removals(comment_body)
-    # Tested after sanitising, so a declaration whose whole content is invisible
-    # controls lands on the extractor's own outcome -- nothing to capture -- rather
-    # than producing a record that counts as a stated reason and reads as nothing.
-    # Identical to the rule the answer and review writers apply, and for the same
-    # reason: a second emptiness rule is a second thing to disagree with this one.
-    if not rationale_text.strip() or len(rationale_text) > MAX_RATIONALE_CHARS:
-        return None
-
-    # The branch comes from the marker when the writer supplied one, because the
-    # writer is the authority on which change it is about. A comment carrying
-    # neither a branch nor one cannot be attached to a change, and a declaration
-    # attached to nothing is one nobody will find again — so the caller's
-    # repository-level fallback is used and the discrepancy is not papered over.
-    anchor_branch = claim.branch or branch
-
-    entry_id = stable_rationale_entry_id(
-        repo=repo,
-        pr_number=pr_number,
-        branch=anchor_branch,
-        declared_by=claim.agent_id,
-        revision=claim.revision,
+    entry_id, revises = _collected_rationale_ids(
+        repo, pr_number, anchor_branch, claim.agent_id, claim.revision
     )
     claim_token = registry.claim_rationale(
         entry_id=entry_id,
@@ -246,17 +204,7 @@ def process_rationale_comment_outcome(
         declared_model=claim.model,
         source=RationaleSource.DECLARED.value,
         revision=claim.revision,
-        revises=(
-            None
-            if claim.revision == 1
-            else stable_rationale_entry_id(
-                repo=repo,
-                pr_number=pr_number,
-                branch=anchor_branch,
-                declared_by=claim.agent_id,
-                revision=claim.revision - 1,
-            )
-        ),
+        revises=revises,
         rationale_text=rationale_text,
     )
     if claim_token is None:
@@ -264,8 +212,106 @@ def process_rationale_comment_outcome(
         # not a new fact, and a second record saying the same thing is the failure
         # semantic_review_event_id exists to prevent.
         return None
+    entry = _build_collected_rationale_entry(
+        entry_id=entry_id,
+        revises=revises,
+        repo=repo,
+        pr_number=pr_number,
+        anchor_branch=anchor_branch,
+        claim=claim,
+        rationale_text=rationale_text,
+        sanitisation_note=sanitisation_note,
+        comment_id=comment_id,
+        comment_author=comment_author,
+        comment_created_at=comment_created_at,
+        author_association=author_association,
+        comment_author_type=comment_author_type,
+        delivery_id=delivery_id,
+    )
+    try:
+        return _deliver_collected_rationale(registry, sink, entry_id, claim_token, entry)
+    except Exception as exc:
+        registry.release_rationale(entry_id, claim_token, type(exc).__name__)
+        raise
 
-    entry = RationaleEntry(
+
+def _parse_rationale_comment(
+    comment_body: str, branch: str
+) -> tuple[RationaleClaim, str, str | None, str] | None:
+    """Parse and sanitise one rationale comment, or None when not capturable."""
+    if len(comment_body) > MAX_RATIONALE_CHARS:
+        return None
+    claim = extract_rationale_claim(comment_body)
+    if claim is None:
+        return None
+    # Two passes, and neither is the other. The extractor is what *reads* the comment:
+    # it parses the ``kojutsu:`` grammar verbatim, so a mangled marker fails closed
+    # rather than being repaired into something this system did not write, and it
+    # normalises a marker's value. :func:`sanitise` is what *stores* the prose, applied
+    # here rather than inside the extractor because a removed character has to be
+    # reported and a function returning a string has nowhere to put that.
+    #
+    # The note is measured against the delivered comment, not against the extracted
+    # prose: the extractor has already removed fourteen of the same characters and
+    # handed back a bare string, so a note computed from it would name only what this
+    # module took. See :func:`kojutsu.core.text_hygiene.describe_removals`.
+    rationale_text = extract_rationale_text_from_comment_body(comment_body)
+    reason_field = sanitise(rationale_text)
+    rationale_text = reason_field.text
+    sanitisation_note = describe_removals(comment_body)
+    # Tested after sanitising, so a declaration whose whole content is invisible
+    # controls lands on the extractor's own outcome -- nothing to capture -- rather
+    # than producing a record that counts as a stated reason and reads as nothing.
+    if not rationale_text.strip() or len(rationale_text) > MAX_RATIONALE_CHARS:
+        return None
+    # The branch comes from the marker when the writer supplied one, because the
+    # writer is the authority on which change it is about.
+    anchor_branch = claim.branch or branch
+    return claim, rationale_text, sanitisation_note, anchor_branch
+
+
+def _collected_rationale_ids(
+    repo: str, pr_number: int, branch: str, agent_id: str, revision: int
+) -> tuple[str, str | None]:
+    entry_id = stable_rationale_entry_id(
+        repo=repo,
+        pr_number=pr_number,
+        branch=branch,
+        declared_by=agent_id,
+        revision=revision,
+    )
+    revises = (
+        None
+        if revision == 1
+        else stable_rationale_entry_id(
+            repo=repo,
+            pr_number=pr_number,
+            branch=branch,
+            declared_by=agent_id,
+            revision=revision - 1,
+        )
+    )
+    return entry_id, revises
+
+
+def _build_collected_rationale_entry(
+    *,
+    entry_id: str,
+    revises: str | None,
+    repo: str,
+    pr_number: int,
+    anchor_branch: str,
+    claim: RationaleClaim,
+    rationale_text: str,
+    sanitisation_note: str | None,
+    comment_id: int,
+    comment_author: str | None,
+    comment_created_at: datetime | None,
+    author_association: str | None,
+    comment_author_type: str | None,
+    delivery_id: str | None,
+) -> RationaleEntry:
+    return RationaleEntry(
         entry_id=entry_id,
         repo=repo,
         pr_number=pr_number,
@@ -278,17 +324,7 @@ def process_rationale_comment_outcome(
         source=RationaleSource.DECLARED,
         channel=RationaleChannel.FORGE_COMMENT,
         revision=claim.revision,
-        revises=(
-            None
-            if claim.revision == 1
-            else stable_rationale_entry_id(
-                repo=repo,
-                pr_number=pr_number,
-                branch=anchor_branch,
-                declared_by=claim.agent_id,
-                revision=claim.revision - 1,
-            )
-        ),
+        revises=revises,
         declared_at=comment_created_at or datetime.now(UTC),
         metadata={
             "github_comment_id": comment_id,
@@ -298,45 +334,44 @@ def process_rationale_comment_outcome(
             # forge attributed to the account, and a reader weighing a declaration
             # weighs it with this beside it.
             "github_author_association": author_association,
-            # Whether the posting account is an application. The capture tool posts
-            # under its own identity, so on this path the flag is usually ``False`` --
-            # but "usually" is why it is recorded rather than assumed, and it is the
-            # same signal and the same key as the review, answer and clarification
-            # paths so one reader serves all four. Provenance, not a judgement.
+            # Whether the posting account is an application. Provenance, not a
+            # judgement, and the same signal and key as the review, answer and
+            # clarification paths so one reader serves all four.
             COMMENT_AUTHOR_IS_MACHINE_KEY: is_machine_account(
                 comment_author, account_type=comment_author_type
             ),
             "delivery_id": delivery_id,
             # What the character policy took out of this declaration, in the record's
-            # own words, and absent when it took nothing -- so its absence is the claim
-            # that this pass took nothing, not that the stored prose is byte-for-byte
-            # the comment. ``build_rationale_frontmatter`` reads it out of ``metadata``,
-            # so unlike an answer, a review or a check run it does reach the document.
+            # own words, and absent when it took nothing.
             **({SANITISATION_KEY: sanitisation_note} if sanitisation_note else {}),
         },
     )
 
-    try:
-        result = sink.store(entry)
-        if result is None:
-            outcome = KnowledgeDeliveryOutcome(
-                entry_id=entry_id,
-                status=KnowledgeDeliveryStatus.QUEUED,
-                detail="Sink returned no explicit delivery outcome; delivery is uncertain",
-            )
-        elif not isinstance(result, KnowledgeDeliveryOutcome):
-            raise TypeError("KnowledgeSink.store must return KnowledgeDeliveryOutcome or None")
-        else:
-            outcome = result
-        if outcome.dead_lettered:
-            if not registry.release_rationale(
-                entry_id, claim_token, outcome.detail or "delivery dead-lettered"
-            ):
-                raise RuntimeError("Failed to release dead-lettered rationale claim")
-            return outcome
-        if not registry.complete_rationale(entry_id, claim_token):
-            raise RuntimeError("Failed to complete rationale capture claim")
-    except Exception as exc:
-        registry.release_rationale(entry_id, claim_token, type(exc).__name__)
-        raise
+
+def _deliver_collected_rationale(
+    registry: QuestionRegistry,
+    sink: KnowledgeSink,
+    entry_id: str,
+    claim_token: str,
+    entry: RationaleEntry,
+) -> KnowledgeDeliveryOutcome:
+    result = sink.store(entry)
+    if result is None:
+        outcome = KnowledgeDeliveryOutcome(
+            entry_id=entry_id,
+            status=KnowledgeDeliveryStatus.QUEUED,
+            detail="Sink returned no explicit delivery outcome; delivery is uncertain",
+        )
+    elif not isinstance(result, KnowledgeDeliveryOutcome):
+        raise TypeError("KnowledgeSink.store must return KnowledgeDeliveryOutcome or None")
+    else:
+        outcome = result
+    if outcome.dead_lettered:
+        if not registry.release_rationale(
+            entry_id, claim_token, outcome.detail or "delivery dead-lettered"
+        ):
+            raise RuntimeError("Failed to release dead-lettered rationale claim")
+        return outcome
+    if not registry.complete_rationale(entry_id, claim_token):
+        raise RuntimeError("Failed to complete rationale capture claim")
     return outcome

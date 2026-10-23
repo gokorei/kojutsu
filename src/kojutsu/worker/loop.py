@@ -29,6 +29,7 @@ from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
+from types import TracebackType
 from typing import Any, Protocol
 
 from kojutsu.core.gates import (
@@ -299,7 +300,12 @@ class Worker:
     def __enter__(self) -> Worker:
         return self
 
-    def __exit__(self, *exc: object) -> None:
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
         self.close()
 
     def requeue(self, item_id: str) -> bool:
@@ -366,39 +372,71 @@ class Worker:
         run: list[Step] = [Step.INTAKE]
         produced: dict[Step, str] = {}
 
-        # The plan gate is consulted before the claim on purpose: a worker must not
-        # take a lease on work it is about to refuse, or a gate a human has left
-        # closed becomes a queue of items held by nobody.
-        for step in (Step.GATE, Step.CLAIM):
-            run.append(step)
-            point = GATE_POINT_FOR_STEP.get(step)
-            if point is not None:
-                stage_blocked, stage_decisions = self._gate(point, context)
-                decisions.extend(stage_decisions)
-                if stage_blocked:
-                    blocking = next(d for d in stage_decisions if d.blocks)
-                    # Recorded, not discarded. A gate holding every item looks
-                    # exactly like an empty queue from the outside, and an operator
-                    # must never have to guess which one they are looking at.
-                    self.state.block(item.item_id, reason=blocking.reason, gate=blocking.gate)
-                    return CycleReport(
-                        outcome=CycleOutcome.GATED,
-                        item=item,
-                        decisions=decisions,
-                        error=blocking.reason,
-                    )
-
-        # Resume rather than restart. A worker killed after opening a pull request
-        # must not open a second one, so the step it reached is durable and the
-        # cycle picks up after it.
-        resume_from = self.state.position(item.item_id)
+        gated = self._gate_early(item, context, run, decisions)
+        if gated is not None:
+            return gated
+        # Resume rather than restart: computed before the claim so the position
+        # a previous cycle reached is what this one continues from.
+        pending = _pending_steps(self.state.position(item.item_id), self.config.steps)
         produced.update(
             (Step(step), value)
             for step, value in self.state.produced(item.item_id).items()
             if step in set(Step)
         )
-        pending = _pending_steps(resume_from, self.config.steps)
+        taken = self._take_claim(item, run)
+        if isinstance(taken, CycleReport):
+            return taken
+        claim_token, attempts = taken
+        try:
+            self._execute_pending(item, pending, run, produced, context, decisions)
+        except _GateStoppedError as err:
+            return self._report_gated(item, run, decisions, attempts, claim_token, err)
+        except Exception as exc:  # any failure must release the claim
+            return self._report_failed(item, run, decisions, attempts, claim_token, exc)
+        return self._finish_item(item, run, produced, decisions, attempts, claim_token)
 
+    def _gate_early(
+        self,
+        item: WorkItem,
+        context: dict[str, Any],
+        run: list[Step],
+        decisions: list[GateDecision],
+    ) -> CycleReport | None:
+        """Consult the pre-claim gates (GATE, CLAIM).
+
+        The plan gate is consulted before the claim on purpose: a worker must
+        not take a lease on work it is about to refuse, or a gate a human has
+        left closed becomes a queue of items held by nobody.
+        """
+        for step in (Step.GATE, Step.CLAIM):
+            run.append(step)
+            point = GATE_POINT_FOR_STEP.get(step)
+            if point is None:
+                continue
+            stage_blocked, stage_decisions = self._gate(point, context)
+            decisions.extend(stage_decisions)
+            if not stage_blocked:
+                continue
+            blocking = next(d for d in stage_decisions if d.blocks)
+            # Recorded, not discarded. A gate holding every item looks
+            # exactly like an empty queue from the outside, and an operator
+            # must never have to guess which one they are looking at.
+            self.state.block(item.item_id, reason=blocking.reason, gate=blocking.gate)
+            return CycleReport(
+                outcome=CycleOutcome.GATED,
+                item=item,
+                decisions=decisions,
+                error=blocking.reason,
+            )
+        return None
+
+    def _take_claim(self, item: WorkItem, run: list[Step]) -> tuple[str, int] | CycleReport:
+        """Take the work claim, recording attempts first.
+
+        Resume rather than restart: a worker killed after opening a pull
+        request must not open a second one, so the step it reached is durable
+        and the cycle picks up after it.
+        """
         attempts = self.state.record_attempt(item.item_id)
         if attempts > self.config.claim_ceiling:
             reason = f"exceeded the claim ceiling of {self.config.claim_ceiling}"
@@ -409,7 +447,6 @@ class Worker:
                 attempts=attempts,
                 error=reason,
             )
-
         claim_token = self.source.claim(item)
         run.pop()  # CLAIM is recorded only once the claim was actually taken
         if claim_token is None:
@@ -432,60 +469,96 @@ class Worker:
             branch=item.branch,
             pr_number=item.pr_number,
         )
+        return claim_token, attempts
 
-        try:
-            for step in pending:
-                run.append(step)
-                # The remaining gates are consulted as the cycle reaches their
-                # lifecycle point, so a gate registered there is not decoration.
-                point = GATE_POINT_FOR_STEP.get(step)
-                if point is not None:
-                    stage_blocked, stage_decisions = self._gate(point, context)
-                    decisions.extend(stage_decisions)
-                    if stage_blocked:
-                        blocking = next(d for d in stage_decisions if d.blocks)
-                        raise _GateStoppedError(blocking.reason, blocking.gate)
-                # Keep what each step actually produced. The implement step's output
-                # is the pull request the forge really opened, and it is the only
-                # honest deliverable available -- guessing one from the branch name
-                # puts a link on the ticket that may not exist.
-                produced[step] = self._dispatch(step, item)
-                # Record position and output before moving on, in one write, so
-                # a crash between two steps resumes at the step that had not
-                # run yet -- with its predecessor's output already stored.
-                self.state.record_step(item.item_id, step.value, produced[step])
-            run.append(Step.COMPLETE)
-        except _GateStoppedError as gated:
-            self.source.release(item, claim_token, gated.reason)
-            self.state.release_claim(item.item_id)
-            self.state.block(item.item_id, reason=gated.reason, gate=gated.gate)
-            return CycleReport(
-                outcome=CycleOutcome.GATED,
-                item=item,
-                steps_run=run,
-                decisions=decisions,
-                error=gated.reason,
-                attempts=attempts,
-            )
-        except Exception as exc:  # any failure must release the claim
-            reason = f"{type(exc).__name__}: {exc}"
-            released = self.source.release(item, claim_token, reason)
-            self.state.release_claim(item.item_id)
-            delay = backoff_for(
-                attempts,
-                base=self.config.backoff_base_seconds,
-                cap=self.config.backoff_cap_seconds,
-            )
-            return CycleReport(
-                outcome=CycleOutcome.FAILED,
-                item=item,
-                steps_run=run,
-                decisions=decisions,
-                error=reason if released else f"{reason} (and the claim could not be released)",
-                attempts=attempts,
-                requeue_after_seconds=delay,
-            )
+    def _execute_pending(
+        self,
+        item: WorkItem,
+        pending: Sequence[Step],
+        run: list[Step],
+        produced: dict[Step, str],
+        context: dict[str, Any],
+        decisions: list[GateDecision],
+    ) -> None:
+        for step in pending:
+            run.append(step)
+            # The remaining gates are consulted as the cycle reaches their
+            # lifecycle point, so a gate registered there is not decoration.
+            point = GATE_POINT_FOR_STEP.get(step)
+            if point is not None:
+                stage_blocked, stage_decisions = self._gate(point, context)
+                decisions.extend(stage_decisions)
+                if stage_blocked:
+                    blocking = next(d for d in stage_decisions if d.blocks)
+                    raise _GateStoppedError(blocking.reason, blocking.gate)
+            # Keep what each step actually produced. The implement step's output
+            # is the pull request the forge really opened, and it is the only
+            # honest deliverable available -- guessing one from the branch name
+            # puts a link on the ticket that may not exist.
+            produced[step] = self._dispatch(step, item)
+            # Record position and output before moving on, in one write, so
+            # a crash between two steps resumes at the step that had not
+            # run yet -- with its predecessor's output already stored.
+            self.state.record_step(item.item_id, step.value, produced[step])
+        run.append(Step.COMPLETE)
 
+    def _report_gated(
+        self,
+        item: WorkItem,
+        run: list[Step],
+        decisions: list[GateDecision],
+        attempts: int,
+        claim_token: str,
+        gated: _GateStoppedError,
+    ) -> CycleReport:
+        self.source.release(item, claim_token, gated.reason)
+        self.state.release_claim(item.item_id)
+        self.state.block(item.item_id, reason=gated.reason, gate=gated.gate)
+        return CycleReport(
+            outcome=CycleOutcome.GATED,
+            item=item,
+            steps_run=run,
+            decisions=decisions,
+            error=gated.reason,
+            attempts=attempts,
+        )
+
+    def _report_failed(
+        self,
+        item: WorkItem,
+        run: list[Step],
+        decisions: list[GateDecision],
+        attempts: int,
+        claim_token: str,
+        exc: Exception,
+    ) -> CycleReport:
+        reason = f"{type(exc).__name__}: {exc}"
+        released = self.source.release(item, claim_token, reason)
+        self.state.release_claim(item.item_id)
+        delay = backoff_for(
+            attempts,
+            base=self.config.backoff_base_seconds,
+            cap=self.config.backoff_cap_seconds,
+        )
+        return CycleReport(
+            outcome=CycleOutcome.FAILED,
+            item=item,
+            steps_run=run,
+            decisions=decisions,
+            error=reason if released else f"{reason} (and the claim could not be released)",
+            attempts=attempts,
+            requeue_after_seconds=delay,
+        )
+
+    def _finish_item(
+        self,
+        item: WorkItem,
+        run: list[Step],
+        produced: dict[Step, str],
+        decisions: list[GateDecision],
+        attempts: int,
+        claim_token: str,
+    ) -> CycleReport:
         # Whatever a step actually produced, in preference order, and never a URL
         # assembled from the branch name: a link that may not exist is worse than no
         # link. A capture-only cycle has no implement step, so its honest
@@ -562,7 +635,7 @@ class Worker:
         self,
         *,
         cycles: int | None = None,
-        sleep: Callable[[float], None] = time.sleep,
+        sleep: Callable[[float], None] | None = None,
         on_report: Callable[[CycleReport], None] | None = None,
     ) -> None:
         """Poll until cancelled, or for a fixed number of cycles in tests.
@@ -573,6 +646,7 @@ class Worker:
         indistinguishable from one that is idle. The ``cycles`` bound is what makes
         the loop testable without a clock.
         """
+        sleeper = sleep if sleep is not None else time.sleep
         completed = 0
         while cycles is None or completed < cycles:
             report = self.run_once()
@@ -582,9 +656,9 @@ class Worker:
             if cycles is not None and completed >= cycles:
                 return
             if report.requeue_after_seconds:
-                sleep(report.requeue_after_seconds)
+                sleeper(report.requeue_after_seconds)
             else:
-                sleep(self.config.poll_interval_seconds)
+                sleeper(self.config.poll_interval_seconds)
 
     def may_merge(self, context: dict[str, Any]) -> tuple[bool, list[GateDecision]]:
         """Whether a pull request may be merged, and why.

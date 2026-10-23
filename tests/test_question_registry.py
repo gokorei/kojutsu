@@ -7,6 +7,18 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from tests.support import (
+    execute_write,
+    executemany_write,
+    index_names,
+    query_all,
+    query_one,
+    query_value,
+    set_user_version,
+    table_columns,
+    table_count,
+    user_version,
+)
 
 import kojutsu.core.question_registry as question_registry_module
 from kojutsu.core.question_registry import SCHEMA_VERSION, SqliteQuestionRegistry
@@ -99,13 +111,17 @@ def test_old_pr_state_schema_is_migrated(tmp_path) -> None:
     registry = SqliteQuestionRegistry(path)
     assert registry.pr_state_change_seen("org/repo", 1, "closed")
     assert not registry.pr_state_change_seen("org/repo", 1, "closed", "new-delivery")
-    columns = {row[1] for row in registry._db.execute("PRAGMA table_info(pr_state_changes)")}
+    columns = table_columns(registry.path, "pr_state_changes")
     assert {"event_id", "status", "claim_token"}.issubset(columns)
-    assert registry._db.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
-    assert registry._db.execute("SELECT COUNT(*) FROM pr_state_changes").fetchone()[0] == 1
-    assert not registry._db.execute(
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'pr_state_changes_legacy'"
-    ).fetchone()
+    assert user_version(registry.path) == SCHEMA_VERSION
+    assert table_count(registry.path, "pr_state_changes") == 1
+    assert (
+        query_one(
+            registry.path,
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'pr_state_changes_legacy'",
+        )
+        is None
+    )
     registry.close()
 
 
@@ -127,11 +143,11 @@ def test_expired_delivery_lease_can_be_reclaimed(tmp_path) -> None:
     registry = SqliteQuestionRegistry(tmp_path / "registry.db")
     first_claim = registry.claim_delivery("delivery-1", "org/repo", "pull_request", "hash-1")
     assert first_claim not in {"duplicate", "conflict"}
-    registry._db.execute(
+    execute_write(
+        registry.path,
         "UPDATE webhook_deliveries SET lease_expires_at = ? WHERE delivery_id = ?",
         ("2000-01-01T00:00:00+00:00", "delivery-1"),
     )
-    registry._db.commit()
 
     second_claim = registry.claim_delivery("delivery-1", "org/repo", "pull_request", "hash-1")
     assert second_claim not in {"duplicate", "conflict"}
@@ -224,11 +240,11 @@ def test_stale_answer_token_cannot_finalize_reclaimed_capture(tmp_path) -> None:
         entry_id="answer-201",
     )
     assert first_claim is not None
-    registry._db.execute(
+    execute_write(
+        registry.path,
         "UPDATE answer_captures SET lease_expires_at = ? WHERE answer_comment_id = ?",
         ("2000-01-01T00:00:00+00:00", 201),
     )
-    registry._db.commit()
 
     second_claim = registry.claim_answer(
         parent_comment_id=100,
@@ -260,7 +276,8 @@ def test_cleanup_deliveries_is_bounded_and_preserves_active_claims(tmp_path) -> 
         ("processing-without-lease", "processing", None, old, None),
         ("retryable", "retryable", None, old, old),
     ]
-    registry._db.executemany(
+    executemany_write(
+        registry.path,
         """
         INSERT INTO webhook_deliveries (
             delivery_id, repo, event, payload_hash, status, completed_at,
@@ -269,20 +286,19 @@ def test_cleanup_deliveries_is_bounded_and_preserves_active_claims(tmp_path) -> 
         """,
         rows,
     )
-    registry._db.commit()
 
     assert registry.cleanup_deliveries(retention_days=30, limit=2) == 2
     assert registry.cleanup_deliveries(retention_days=30, limit=2) == 1
     assert registry.cleanup_deliveries(retention_days=30) == 0
     remaining = {
-        row[0] for row in registry._db.execute("SELECT delivery_id FROM webhook_deliveries")
+        row[0] for row in query_all(registry.path, "SELECT delivery_id FROM webhook_deliveries")
     }
     assert remaining == {
         "recent-completed",
         "active-processing",
         "processing-without-lease",
     }
-    indexes = {row[1] for row in registry._db.execute("PRAGMA index_list(webhook_deliveries)")}
+    indexes = index_names(registry.path, "webhook_deliveries")
     assert "webhook_deliveries_completed_idx" in indexes
     with pytest.raises(ValueError):
         registry.cleanup_deliveries(retention_days=-1)
@@ -361,7 +377,7 @@ def test_migration_failure_rolls_back_closes_and_retries(tmp_path, monkeypatch) 
     monkeypatch.setattr(question_registry_module, "_migrate_schema", original_migrate)
     registry = SqliteQuestionRegistry(path)
     assert registry.pr_state_change_seen("org/repo", 1, "closed")
-    assert registry._db.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+    assert user_version(registry.path) == SCHEMA_VERSION
     registry.close()
 
 
@@ -418,11 +434,11 @@ def test_list_questions_order_is_total_so_paging_never_skips_or_repeats(tmp_path
         if not page:
             break
         walked.extend(row["question_id"] for row in page)
-        registry._db.execute(
+        execute_write(
+            registry.path,
             "DELETE FROM questions WHERE question_id IN (?, ?)",
             tuple(row["question_id"] for row in page),
         )
-        registry._db.commit()
     assert walked == first
     assert len(set(walked)) == 6
     assert registry.list_questions(status="pending") == []
@@ -447,12 +463,13 @@ def test_enumeration_uses_the_work_index_rather_than_scanning(tmp_path) -> None:
     _record(registry, "q1", repo="org/repo", pr_number=1)
     plan = " ".join(
         str(row[3])
-        for row in registry._db.execute(
+        for row in query_all(
+            registry.path,
             """
             EXPLAIN QUERY PLAN
             SELECT question_id FROM questions
             WHERE status = 'pending' AND repo = 'org/repo' AND pr_number = 1
-            """
+            """,
         )
     )
     assert "questions_work_idx" in plan
@@ -522,11 +539,11 @@ def test_expired_question_lease_is_stealable_and_counts_the_attempt(tmp_path) ->
     _record(registry, "q1", repo="org/repo", pr_number=1)
     stale = registry.claim_question_for_answer("q1", "worker-a")
     assert stale is not None
-    registry._db.execute(
+    execute_write(
+        registry.path,
         "UPDATE questions SET lease_expires_at = ? WHERE question_id = ?",
         ("2000-01-01T00:00:00+00:00", "q1"),
     )
-    registry._db.commit()
 
     fresh = registry.claim_question_for_answer("q1", "worker-b")
     assert fresh is not None
@@ -539,9 +556,9 @@ def test_expired_question_lease_is_stealable_and_counts_the_attempt(tmp_path) ->
     assert not registry.release_question("q1", stale, "dead worker cleaning up")
     assert registry.list_questions(status="claimed")[0]["assignee"] == "worker-b"
     assert (
-        registry._db.execute(
-            "SELECT claim_token FROM questions WHERE question_id = ?", ("q1",)
-        ).fetchone()[0]
+        query_value(
+            registry.path, "SELECT claim_token FROM questions WHERE question_id = ?", ("q1",)
+        )
         == fresh
     )
     registry.close()
@@ -615,9 +632,9 @@ def test_release_question_requeues_and_preserves_the_attempt_count(tmp_path) -> 
     assert requeued["last_error"] == "github unavailable"
     assert requeued["last_attempt_at"] is not None
     assert (
-        registry._db.execute(
-            "SELECT claim_token FROM questions WHERE question_id = ?", ("q1",)
-        ).fetchone()[0]
+        query_value(
+            registry.path, "SELECT claim_token FROM questions WHERE question_id = ?", ("q1",)
+        )
         is None
     )
 
@@ -643,9 +660,10 @@ def test_recording_a_question_never_walks_an_answered_one_back(tmp_path) -> None
     assert answered["attempts"] == 0
     # The disagreement the migration refuses to tolerate must not be creatable.
     assert (
-        registry._db.execute(
-            "SELECT COUNT(*) FROM questions WHERE answered = 1 AND status <> 'answered'"
-        ).fetchone()[0]
+        query_value(
+            registry.path,
+            "SELECT COUNT(*) FROM questions WHERE answered = 1 AND status <> 'answered'",
+        )
         == 0
     )
     registry.close()
@@ -655,11 +673,14 @@ def test_status_vocabulary_is_enforced_by_the_database(tmp_path) -> None:
     registry = SqliteQuestionRegistry(tmp_path / "registry.db")
     _record(registry, "q1", repo="org/repo", pr_number=1)
     with pytest.raises(sqlite3.IntegrityError, match="documented vocabulary"):
-        registry._db.execute("UPDATE questions SET status = 'invented' WHERE question_id = 'q1'")
+        execute_write(
+            registry.path, "UPDATE questions SET status = 'invented' WHERE question_id = 'q1'"
+        )
     with pytest.raises(sqlite3.IntegrityError, match="documented vocabulary"):
-        registry._db.execute(
+        execute_write(
+            registry.path,
             "INSERT INTO questions (question_id, status, created_at) "
-            "VALUES ('q2', 'invented', '2026-01-01')"
+            "VALUES ('q2', 'invented', '2026-01-01')",
         )
     assert registry.list_questions(status="pending")[0]["status"] == "pending"
     registry.close()
@@ -754,7 +775,7 @@ def test_question_answered_before_the_migration_still_reads_as_answered(tmp_path
     )
 
     registry = SqliteQuestionRegistry(path)
-    assert registry._db.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+    assert user_version(registry.path) == SCHEMA_VERSION
     assert registry.is_question_answered(100)
     assert not registry.is_question_answered(101)
 
@@ -765,9 +786,10 @@ def test_question_answered_before_the_migration_still_reads_as_answered(tmp_path
     assert answered[0]["updated_at"] == "2023-01-01T00:00:00+00:00"
 
     # The captured entry the answer produced is untouched by the migration.
-    capture = registry._db.execute(
-        "SELECT entry_id, status, completed_at FROM answer_captures WHERE answer_comment_id = 9001"
-    ).fetchone()
+    capture = query_one(
+        registry.path,
+        "SELECT entry_id, status, completed_at FROM answer_captures WHERE answer_comment_id = 9001",
+    )
     assert capture == ("answer-9001", "completed", "2023-01-01T00:00:00+00:00")
     registry.close()
 
@@ -830,10 +852,11 @@ def test_migration_is_checksummed_forward_only_and_preserves_existing_rows(tmp_p
     _write_v3_registry(path, questions=original)
 
     registry = SqliteQuestionRegistry(path)
-    rows = registry._db.execute(
+    rows = query_all(
+        registry.path,
         "SELECT question_id, question_text, created_at, error_message, jira_ticket_key "
-        "FROM questions ORDER BY question_id"
-    ).fetchall()
+        "FROM questions ORDER BY question_id",
+    )
     assert rows == [
         (
             f"q{index}",
@@ -845,9 +868,9 @@ def test_migration_is_checksummed_forward_only_and_preserves_existing_rows(tmp_p
         for index in range(4)
     ], "existing rows must be preserved, not rewritten"
 
-    recorded = registry._db.execute(
-        "SELECT version, checksum FROM registry_migrations ORDER BY version"
-    ).fetchall()
+    recorded = query_all(
+        registry.path, "SELECT version, checksum FROM registry_migrations ORDER BY version"
+    )
     # Derived from the ledger rather than spelled out, so a new migration is
     # covered by this assertion the moment it is registered instead of needing
     # this test edited -- which is the failure mode a hardcoded list invites.
@@ -860,7 +883,7 @@ def test_migration_is_checksummed_forward_only_and_preserves_existing_rows(tmp_p
     # Reopening a migrated registry is a no-op: the ledger prevents a replay.
     reopened = SqliteQuestionRegistry(path)
     assert reopened.count_questions() == 4
-    assert reopened._db.execute("SELECT COUNT(*) FROM registry_migrations").fetchone()[0] == len(
+    assert table_count(reopened.path, "registry_migrations") == len(
         question_registry_module._LEDGERED_MIGRATIONS
     )
     reopened.close()
@@ -869,8 +892,7 @@ def test_migration_is_checksummed_forward_only_and_preserves_existing_rows(tmp_p
 def test_rewritten_migration_history_is_refused_rather_than_replayed(tmp_path) -> None:
     path = tmp_path / "registry.db"
     registry = SqliteQuestionRegistry(path)
-    registry._db.execute("UPDATE registry_migrations SET checksum = 'tampered'")
-    registry._db.commit()
+    execute_write(registry.path, "UPDATE registry_migrations SET checksum = 'tampered'")
     registry.close()
 
     with pytest.raises(RuntimeError, match="does not match"):
@@ -889,7 +911,7 @@ def test_rewritten_migration_history_is_refused_rather_than_replayed(tmp_path) -
 def test_registry_newer_than_this_application_is_refused(tmp_path) -> None:
     path = tmp_path / "registry.db"
     registry = SqliteQuestionRegistry(path)
-    registry._db.execute(f"PRAGMA user_version = {SCHEMA_VERSION + 1}")
+    set_user_version(registry.path, SCHEMA_VERSION + 1)
     registry.close()
     with pytest.raises(RuntimeError, match="newer than this application"):
         SqliteQuestionRegistry(path)
@@ -927,10 +949,10 @@ def test_a_fresh_registry_reaches_the_current_schema_with_the_rationale_table(tm
 
     tables = {
         row[0]
-        for row in registry._db.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        for row in query_all(registry.path, "SELECT name FROM sqlite_master WHERE type = 'table'")
     }
-    indexes = {str(row[1]) for row in registry._db.execute("PRAGMA index_list(rationale_captures)")}
-    version = registry._db.execute("PRAGMA user_version").fetchone()[0]
+    indexes = index_names(registry.path, "rationale_captures")
+    version = user_version(registry.path)
     registry.close()
 
     assert "rationale_captures" in tables
@@ -964,7 +986,7 @@ def test_racing_claims_on_one_declaration_yield_exactly_one_record(tmp_path) -> 
     first = _claim_rationale(registry)
     assert first is not None
     second = _claim_rationale(registry)
-    count = registry._db.execute("SELECT COUNT(*) FROM rationale_captures").fetchone()[0]
+    count = table_count(registry.path, "rationale_captures")
     registry.close()
 
     assert second is None, "a second claim on a live lease must be refused"
@@ -1003,10 +1025,10 @@ def test_an_expired_lease_is_reclaimable_and_stale_tokens_stop_working(tmp_path)
 
     stale = _claim_rationale(registry)
     assert stale is not None
-    registry._db.execute(
-        "UPDATE rationale_captures SET lease_expires_at = '2000-01-01T00:00:00+00:00'"
+    execute_write(
+        registry.path,
+        "UPDATE rationale_captures SET lease_expires_at = '2000-01-01T00:00:00+00:00'",
     )
-    registry._db.commit()
 
     fresh = _claim_rationale(registry)
     assert fresh is not None
@@ -1028,9 +1050,10 @@ def test_a_released_claim_is_retryable_and_keeps_the_error(tmp_path) -> None:
     token = _claim_rationale(registry)
     assert token is not None
     assert registry.release_rationale("rationale-v1-a", token, "store unreachable") is True
-    row = registry._db.execute(
-        "SELECT status, last_error FROM rationale_captures WHERE entry_id = 'rationale-v1-a'"
-    ).fetchone()
+    row = query_one(
+        registry.path,
+        "SELECT status, last_error FROM rationale_captures WHERE entry_id = 'rationale-v1-a'",
+    )
     registry.close()
 
     assert row[0] == "retryable"
@@ -1065,9 +1088,10 @@ def test_a_derived_id_that_now_describes_something_else_is_refused(tmp_path) -> 
     assert registry.complete_rationale("rationale-v1-a", first) is True
 
     conflicting = _claim_rationale(registry, rationale_text="Something else entirely.")
-    stored = registry._db.execute(
-        "SELECT rationale_text FROM rationale_captures WHERE entry_id = 'rationale-v1-a'"
-    ).fetchone()[0]
+    stored = query_value(
+        registry.path,
+        "SELECT rationale_text FROM rationale_captures WHERE entry_id = 'rationale-v1-a'",
+    )
     registry.close()
 
     assert conflicting is None
@@ -1226,13 +1250,13 @@ def test_a_v6_registry_gains_the_anchor_without_being_backfilled(tmp_path: Path)
     )
 
     registry = SqliteQuestionRegistry(path)
-    columns = {row[1] for row in registry._db.execute("PRAGMA table_info(questions)")}
-    rows = registry._db.execute(
-        "SELECT question_id, question_text, created_at, head_sha FROM questions"
-    ).fetchall()
-    ledger = registry._db.execute(
-        "SELECT version, checksum FROM registry_migrations ORDER BY version"
-    ).fetchall()
+    columns = table_columns(registry.path, "questions")
+    rows = query_all(
+        registry.path, "SELECT question_id, question_text, created_at, head_sha FROM questions"
+    )
+    ledger = query_all(
+        registry.path, "SELECT version, checksum FROM registry_migrations ORDER BY version"
+    )
     registry.close()
 
     assert "head_sha" in columns, "the column is the deliverable"
@@ -1303,8 +1327,9 @@ def test_v7_is_refused_when_its_recorded_checksum_disagrees(tmp_path: Path) -> N
     """
     path = tmp_path / "registry.db"
     registry = SqliteQuestionRegistry(path)
-    registry._db.execute("UPDATE registry_migrations SET checksum = 'tampered' WHERE version = 7")
-    registry._db.commit()
+    execute_write(
+        registry.path, "UPDATE registry_migrations SET checksum = 'tampered' WHERE version = 7"
+    )
     registry.close()
 
     with pytest.raises(RuntimeError, match=r"migration 7 .* does not match"):

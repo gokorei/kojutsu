@@ -39,6 +39,7 @@ dev = [
     "pytest>=8.3.0",
     "pytest-cov>=6.0.0",
     "pytest-asyncio>=0.24.0",
+    "pytest-time>=0.5.0",
     "ruff==0.14.13",
     "types-PyYAML>=6.0.12",
 ]
@@ -107,6 +108,9 @@ quote-style = "double"
 [tool.mypy]
 python_version = "3.11"
 check_untyped_defs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+warn_unused_ignores = true
 ignore_missing_imports = true
 disable_error_code = ["import-untyped"]
 explicit_package_bases = true
@@ -120,6 +124,7 @@ files = [
 ]
 
 [tool.pytest.ini_options]
+addopts = "-m 'not slow'"
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]

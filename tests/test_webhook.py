@@ -130,14 +130,14 @@ def test_webhook_ready_builds_and_verifies_owned_runtime(monkeypatch) -> None:
     unwritable = client.get("/webhook/ready")
 
     assert missing_token.status_code == 503
-    assert missing_token.json() == {"detail": "GITHUB_TOKEN is not configured"}
+    assert missing_token.json() == {"detail": "Service Unavailable"}
     assert ready.status_code == 200
     assert ready.json()["sqlite_writable"] is True
     assert ready.json()["runtime_ready"] is True
     assert ready.json()["outbox_owned"] is True
     assert get_runtime_calls == [1]
     assert unwritable.status_code == 503
-    assert unwritable.json() == {"detail": "Local SQLite storage is not writable"}
+    assert unwritable.json() == {"detail": "Service Unavailable"}
 
 
 def test_webhook_ready_fails_closed_when_another_process_owns_outbox(monkeypatch) -> None:
@@ -154,7 +154,7 @@ def test_webhook_ready_fails_closed_when_another_process_owns_outbox(monkeypatch
     response = client.get("/webhook/ready")
 
     assert response.status_code == 503
-    assert response.json() == {"detail": "Outbox is owned by another process"}
+    assert response.json() == {"detail": "Service Unavailable"}
 
 
 @pytest.mark.parametrize("allowlist", ["", "*"])
@@ -169,7 +169,8 @@ def test_readiness_rejects_empty_or_wildcard_repository_allowlist(
     response = client.get("/webhook/ready")
 
     assert response.status_code == 503
-    assert "No exact repositories" in response.json()["detail"]
+    # Unauthenticated readiness is generic so a prober cannot enumerate config.
+    assert response.json() == {"detail": "Service Unavailable"}
 
 
 def test_status_requires_authentication_and_uses_configured_url(monkeypatch) -> None:

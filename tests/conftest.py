@@ -72,8 +72,7 @@ def _close_resource(resource: object) -> Exception | None:
 
 
 def _close_test_resources(resources: list[object]) -> None:
-    runtime = runtime_module._runtime
-    runtime_module._runtime = None
+    runtime = runtime_module.install_runtime(None)
     first_error: Exception | None = None
     closed_ids: set[int] = set()
 
@@ -216,3 +215,8 @@ def make_mock_client(
 ) -> httpx.Client:
     """One ``httpx.Client`` over a mock transport (close when done)."""
     return httpx.Client(transport=make_mock_transport(handler))
+
+
+@pytest.fixture
+def fast_sleep(instant_sleep: Any) -> None:
+    """Fast-forward time.sleep using pytest-time's instant_sleep."""

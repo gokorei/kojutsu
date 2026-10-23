@@ -170,7 +170,9 @@ both their Kojutsu marker and authenticated GitHub author provenance match.
 This:
 1. Fetches the PR diff and changed files
 2. Extracts Jira ticket from branch name (e.g., `feature/PROJ-123-description`)
-3. Calls LLM to generate relevant questions
+3. Groups the diff into reviewable chapters and collects the pull request's own
+   description as a prologue, then calls the LLM to generate questions once per
+   area rather than once per prompt
 4. Persists the exact plan and posts its questions as authenticated GitHub comments
 
 #### 2. Design a Phase, Then Approve It
@@ -292,7 +294,9 @@ uv run kojutsu console
 
 The console binds to `127.0.0.1` by default. A public bind requires both
 `DEV_CONSOLE_TOKEN` and the explicit `--allow-insecure-bind` flag; browsers
-authenticate with username `kojutsu` and the token as the password.
+authenticate with username `kojutsu` and the token as the password. On a
+multi-user host, set `DEV_CONSOLE_TOKEN` even for a loopback bind: loopback
+without a token serves status and Tanseki search to any local process or user.
 
 ## MCP Server
 

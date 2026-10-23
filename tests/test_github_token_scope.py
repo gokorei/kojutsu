@@ -160,7 +160,7 @@ def test_an_accepted_credential_is_not_re_checked_on_every_call(
     client.list_issue_comments("org", "repo", 1)
     client.list_issue_comments("org", "repo", 1)
 
-    assert client._scope_checked is True
+    assert client.scope_checked is True
 
 
 def test_a_transport_error_is_raised_before_the_scope_check(

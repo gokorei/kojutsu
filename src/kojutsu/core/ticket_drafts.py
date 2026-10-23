@@ -99,6 +99,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from types import TracebackType
 from typing import Any, Protocol, runtime_checkable
 
 from kojutsu.core.design_capture import ReconciliationOutcome, design_plan_digest
@@ -511,12 +512,36 @@ def create_tickets_from_plan(
         raise PlanChangedError(
             presented_sha256=presented, reconciled_sha256=reconciliation.plan_sha256
         )
-
     ordered = ticket_drafts_in_dependency_order(plan)
+    decisions, approval = _evaluate_plan_gate(
+        gates=gates, approvals=approvals, presented=presented, reconciliation=reconciliation
+    )
+    created, existing, dependencies = _write_tickets_in_order(
+        sink, ordered, presented=presented, reconciliation=reconciliation
+    )
+    return TicketCreationOutcome(
+        plan_sha256=presented,
+        reconciliation_entry_id=reconciliation.entry_id,
+        reconciliation_captured=reconciliation.captured,
+        created=tuple(created),
+        existing=tuple(existing),
+        dependencies=tuple(dependencies),
+        decisions=tuple(decisions),
+        approval=approval,
+    )
+
+
+def _evaluate_plan_gate(
+    *,
+    gates: GateRegistry | None,
+    approvals: PlanApprovalLedger,
+    presented: str,
+    reconciliation: ReconciliationOutcome,
+) -> tuple[list[GateDecision], PlanApproval | None]:
+    """Evaluate the approval gate and record every decision before acting on it."""
     registry = (
         gates if gates is not None else GateRegistry(plan_approval_gates(approvals=approvals))
     )
-
     approval = approvals.get_approval(plan_sha256=presented)
     decisions = registry.evaluate(
         LifecyclePoint.PLAN_PROPOSED,
@@ -537,7 +562,23 @@ def create_tickets_from_plan(
         )
     if GateRegistry.is_blocked(decisions):
         raise PlanApprovalRequiredError(decisions, plan_sha256=presented)
+    return decisions, approval
 
+
+def _write_tickets_in_order(
+    sink: TicketSink,
+    ordered: list[TicketDraft],
+    *,
+    presented: str,
+    reconciliation: ReconciliationOutcome,
+) -> tuple[list[str], list[str], list[TicketDependency]]:
+    """Write one committed row per draft, in dependency order.
+
+    On partial failure the tickets already written stay, and
+    :class:`TicketSetIncompleteError` names both halves. Nothing is rolled back,
+    because each ticket is its own transaction and the ids are derived --
+    re-running finishes the set rather than duplicating it.
+    """
     created: list[str] = []
     existing: list[str] = []
     dependencies: list[TicketDependency] = []
@@ -562,17 +603,7 @@ def create_tickets_from_plan(
             TicketDependency(ticket_id=ticket.ticket_id, depends_on=blocker)
             for blocker in ticket.depends_on
         )
-
-    return TicketCreationOutcome(
-        plan_sha256=presented,
-        reconciliation_entry_id=reconciliation.entry_id,
-        reconciliation_captured=reconciliation.captured,
-        created=tuple(created),
-        existing=tuple(existing),
-        dependencies=tuple(dependencies),
-        decisions=tuple(decisions),
-        approval=approval,
-    )
+    return created, existing, dependencies
 
 
 #: Schema v1 of the ticket store: the tickets, and the edges between them.
@@ -692,7 +723,12 @@ class SqliteTicketSink:
     def __enter__(self) -> SqliteTicketSink:
         return self
 
-    def __exit__(self, *exc: object) -> None:
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
         self.close()
 
     def record_ticket(self, ticket: DerivedTicket) -> bool:

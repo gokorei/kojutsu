@@ -566,7 +566,57 @@ def capture_design_proposal(
     _check_model(model)
     _check_topic(topic)
     _check_revision(revision, "design proposal")
+    sanitised = _sanitise_proposal_text(text)
+    proposal_text, note = sanitised
+    entry_id = stable_design_proposal_id(
+        repo=repo, topic=topic, declared_by=principal, revision=revision
+    )
+    entry = _build_proposal_entry(
+        repo=repo,
+        topic=topic,
+        principal=principal,
+        model=model,
+        proposal_text=proposal_text,
+        note=note,
+        revision=revision,
+        entry_id=entry_id,
+        proposed_at=proposed_at,
+    )
 
+    token = registry.claim_rationale(
+        entry_id=entry_id,
+        repo=repo,
+        pr_number=None,
+        branch=topic,
+        declared_by=principal,
+        declared_model=model,
+        source=RationaleSource.DECLARED.value,
+        revision=revision,
+        revises=entry.revises,
+        rationale_text=proposal_text,
+    )
+    proposal = DesignProposal(principal=principal, model=model, revision=revision)
+    if token is None:
+        return ProposalCaptureOutcome(
+            entry_id=entry_id,
+            proposal=proposal,
+            captured=False,
+            delivery=None,
+            detail=(
+                "A proposal already captured for this repository, topic, principal and "
+                "revision is not stored twice; re-running this capture is a no-op. The "
+                "identity excludes the text, so a rephrasing is the same record and a "
+                "genuinely new argument must take the next revision."
+            ),
+        )
+
+    delivery = _store_claim(entry, registry=registry, sink=sink, entry_id=entry_id, token=token)
+    return ProposalCaptureOutcome(
+        entry_id=entry_id, proposal=proposal, captured=True, delivery=delivery
+    )
+
+
+def _sanitise_proposal_text(text: str) -> tuple[str, str]:
     field = sanitise(text)
     proposal_text = field.text
     note = field.note()
@@ -581,11 +631,22 @@ def capture_design_proposal(
             f"{len(proposal_text)}; it is refused rather than truncated, because a cut "
             f"argument stored under its own principal is a different one"
         )
+    return proposal_text, note
 
-    entry_id = stable_design_proposal_id(
-        repo=repo, topic=topic, declared_by=principal, revision=revision
-    )
-    entry = RationaleEntry(
+
+def _build_proposal_entry(
+    *,
+    repo: str,
+    topic: str,
+    principal: str,
+    model: str | None,
+    proposal_text: str,
+    note: str,
+    revision: int,
+    entry_id: str,
+    proposed_at: datetime | None,
+) -> RationaleEntry:
+    return RationaleEntry(
         entry_id=entry_id,
         repo=repo,
         # No pull request and no branch: a design proposal precedes both. The topic is
@@ -620,38 +681,6 @@ def capture_design_proposal(
             # :func:`kojutsu.core.text_hygiene.describe_removals` exists to avoid.
             **({SANITISATION_KEY: note} if note else {}),
         },
-    )
-
-    token = registry.claim_rationale(
-        entry_id=entry_id,
-        repo=repo,
-        pr_number=None,
-        branch=topic,
-        declared_by=principal,
-        declared_model=model,
-        source=RationaleSource.DECLARED.value,
-        revision=revision,
-        revises=entry.revises,
-        rationale_text=proposal_text,
-    )
-    proposal = DesignProposal(principal=principal, model=model, revision=revision)
-    if token is None:
-        return ProposalCaptureOutcome(
-            entry_id=entry_id,
-            proposal=proposal,
-            captured=False,
-            delivery=None,
-            detail=(
-                "A proposal already captured for this repository, topic, principal and "
-                "revision is not stored twice; re-running this capture is a no-op. The "
-                "identity excludes the text, so a rephrasing is the same record and a "
-                "genuinely new argument must take the next revision."
-            ),
-        )
-
-    delivery = _store_claim(entry, registry=registry, sink=sink, entry_id=entry_id, token=token)
-    return ProposalCaptureOutcome(
-        entry_id=entry_id, proposal=proposal, captured=True, delivery=delivery
     )
 
 
@@ -707,6 +736,120 @@ def reconcile_design_proposals(
     _check_model(model)
     _check_topic(topic)
     _check_revision(revision, "design reconciliation")
+    by_proposal, phrases = _validate_reconciliation_inputs(
+        repo=repo,
+        topic=topic,
+        reconciled_by=reconciled_by,
+        model=model,
+        proposals=proposals,
+        registry=registry,
+    )
+    plan, plan_sha256, discard_entries, body, note = _render_reconciliation_body(
+        repo=repo,
+        topic=topic,
+        reconciled_by=reconciled_by,
+        model=model,
+        plan_payload=plan_payload,
+        by_proposal=by_proposal,
+        phrases=phrases,
+        discarded=discarded,
+    )
+    entry_id = stable_design_reconciliation_id(
+        repo=repo, topic=topic, reconciled_by=reconciled_by, revision=revision
+    )
+    entry = _build_reconciliation_entry(
+        repo=repo,
+        topic=topic,
+        reconciled_by=reconciled_by,
+        model=model,
+        plan=plan,
+        plan_sha256=plan_sha256,
+        by_proposal=by_proposal,
+        discard_entries=discard_entries,
+        body=body,
+        note=note,
+        revision=revision,
+        entry_id=entry_id,
+        reconciled_at=reconciled_at,
+    )
+
+    token = registry.claim_rationale(
+        entry_id=entry_id,
+        repo=repo,
+        pr_number=None,
+        branch=topic,
+        declared_by=reconciled_by,
+        declared_model=model,
+        source=RationaleSource.DECLARED.value,
+        revision=revision,
+        revises=entry.revises,
+        rationale_text=body,
+    )
+    return _claim_or_store_reconciliation(
+        registry,
+        sink,
+        entry=entry,
+        entry_id=entry_id,
+        token=token,
+        plan=plan,
+        plan_sha256=plan_sha256,
+        by_proposal=by_proposal,
+        discard_entries=discard_entries,
+    )
+
+
+def _claim_or_store_reconciliation(
+    registry: QuestionRegistry,
+    sink: KnowledgeSink,
+    *,
+    entry: RationaleEntry,
+    entry_id: str,
+    token: str | None,
+    plan: DesignPlan,
+    plan_sha256: str,
+    by_proposal: dict[DesignProposal, str],
+    discard_entries: list[tuple[str, DiscardedProposal, str]],
+) -> ReconciliationOutcome:
+    proposal_ids = tuple(sorted(by_proposal.values()))
+    discarded_proposals = tuple(discard for _, discard, _ in discard_entries)
+    if token is None:
+        return ReconciliationOutcome(
+            entry_id=entry_id,
+            plan=plan,
+            plan_sha256=plan_sha256,
+            proposal_ids=proposal_ids,
+            discarded=discarded_proposals,
+            captured=False,
+            delivery=None,
+            detail=(
+                "A reconciliation already exists for this repository, topic, reconciler "
+                "and revision, so this one is not recorded and the stored one stands. "
+                f"The plan in hand digests to {plan_sha256}; nothing here compares it "
+                "against the recorded plan, so a caller that needs its own plan "
+                "recorded must take the next revision."
+            ),
+        )
+    delivery = _store_claim(entry, registry=registry, sink=sink, entry_id=entry_id, token=token)
+    return ReconciliationOutcome(
+        entry_id=entry_id,
+        plan=plan,
+        plan_sha256=plan_sha256,
+        proposal_ids=proposal_ids,
+        discarded=discarded_proposals,
+        captured=True,
+        delivery=delivery,
+    )
+
+
+def _validate_reconciliation_inputs(
+    *,
+    repo: str,
+    topic: str,
+    reconciled_by: str,
+    model: str | None,
+    proposals: Sequence[DesignProposal],
+    registry: QuestionRegistry,
+) -> tuple[dict[DesignProposal, str], tuple[str, ...]]:
     if not proposals:
         raise ValueError(
             "a reconciliation needs at least one captured proposal; reconciling nothing "
@@ -718,7 +861,6 @@ def reconcile_design_proposals(
             f"{len(proposals)}; the human gate reads this record once, and a record "
             f"past the length anyone reads is a gate with the appearance of one"
         )
-
     # Keyed by the proposal rather than by its id, so a discard can be resolved to the
     # record it is about by value. Two equal proposals in the list are one proposal --
     # the identity is the same three fields either way -- and collapsing them here is
@@ -737,10 +879,22 @@ def reconcile_design_proposals(
     _check_proposals_captured(
         registry=registry, repo=repo, topic=topic, ids=set(by_proposal.values())
     )
+    return by_proposal, phrases
 
+
+def _render_reconciliation_body(
+    *,
+    repo: str,
+    topic: str,
+    reconciled_by: str,
+    model: str | None,
+    plan_payload: str | bytes | dict[str, Any],
+    by_proposal: dict[DesignProposal, str],
+    phrases: Sequence[str],
+    discarded: Sequence[DiscardedProposal],
+) -> tuple[DesignPlan, str, list[tuple[str, DiscardedProposal, str]], str, str | None]:
     plan = parse_design_plan(plan_payload)
     plan_sha256 = design_plan_digest(plan)
-
     discard_entries = _check_discarded(discarded=discarded, by_proposal=by_proposal)
     body = _render_reconciliation(
         topic=topic,
@@ -757,11 +911,26 @@ def reconcile_design_proposals(
     # :func:`kojutsu.core.text_hygiene.describe_removals`, which is the whole reason that
     # function takes the payload rather than the stored value.
     note = describe_removals(*[discard.reason for _, discard, _ in discard_entries])
+    return plan, plan_sha256, discard_entries, body, note
 
-    entry_id = stable_design_reconciliation_id(
-        repo=repo, topic=topic, reconciled_by=reconciled_by, revision=revision
-    )
-    entry = RationaleEntry(
+
+def _build_reconciliation_entry(
+    *,
+    repo: str,
+    topic: str,
+    reconciled_by: str,
+    model: str | None,
+    plan: DesignPlan,
+    plan_sha256: str,
+    by_proposal: dict[DesignProposal, str],
+    discard_entries: list[tuple[str, DiscardedProposal, str]],
+    body: str,
+    note: str | None,
+    revision: int,
+    entry_id: str,
+    reconciled_at: datetime | None,
+) -> RationaleEntry:
+    return RationaleEntry(
         entry_id=entry_id,
         repo=repo,
         pr_number=None,
@@ -798,49 +967,6 @@ def reconcile_design_proposals(
             ],
             **({SANITISATION_KEY: note} if note else {}),
         },
-    )
-
-    token = registry.claim_rationale(
-        entry_id=entry_id,
-        repo=repo,
-        pr_number=None,
-        branch=topic,
-        declared_by=reconciled_by,
-        declared_model=model,
-        source=RationaleSource.DECLARED.value,
-        revision=revision,
-        revises=entry.revises,
-        rationale_text=body,
-    )
-    proposal_ids = tuple(sorted(by_proposal.values()))
-    discarded_proposals = tuple(discard for _, discard, _ in discard_entries)
-    if token is None:
-        return ReconciliationOutcome(
-            entry_id=entry_id,
-            plan=plan,
-            plan_sha256=plan_sha256,
-            proposal_ids=proposal_ids,
-            discarded=discarded_proposals,
-            captured=False,
-            delivery=None,
-            detail=(
-                "A reconciliation already exists for this repository, topic, reconciler "
-                "and revision, so this one is not recorded and the stored one stands. "
-                f"The plan in hand digests to {plan_sha256}; nothing here compares it "
-                "against the recorded plan, so a caller that needs its own plan "
-                "recorded must take the next revision."
-            ),
-        )
-
-    delivery = _store_claim(entry, registry=registry, sink=sink, entry_id=entry_id, token=token)
-    return ReconciliationOutcome(
-        entry_id=entry_id,
-        plan=plan,
-        plan_sha256=plan_sha256,
-        proposal_ids=proposal_ids,
-        discarded=discarded_proposals,
-        captured=True,
-        delivery=delivery,
     )
 
 

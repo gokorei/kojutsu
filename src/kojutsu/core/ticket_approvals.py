@@ -18,6 +18,7 @@ import threading
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from types import TracebackType
 from typing import Any, Protocol, runtime_checkable
 
 from kojutsu.core.design_capture import ReconciliationOutcome
@@ -811,7 +812,12 @@ class SqlitePlanApprovalLedger:
     def __enter__(self) -> SqlitePlanApprovalLedger:
         return self
 
-    def __exit__(self, *exc: object) -> None:
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
         self.close()
 
     def get_approval(self, *, plan_sha256: str) -> PlanApproval | None:

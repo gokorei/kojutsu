@@ -31,6 +31,7 @@ from __future__ import annotations
 import threading
 import time
 from collections.abc import Callable, Sequence
+from types import TracebackType
 from typing import Any, Protocol
 
 import httpx
@@ -146,7 +147,7 @@ class GitHubHistoryReader:
         token: str,
         *,
         base_url: str = "https://api.github.com",
-        sleep: Callable[[float], None] = time.sleep,
+        sleep: Callable[[float], None] | None = None,
         rate_limit_retries: int = DEFAULT_RATE_LIMIT_RETRIES,
         max_backoff_seconds: float = MAX_RATE_LIMIT_BACKOFF_SECONDS,
     ) -> None:
@@ -156,7 +157,7 @@ class GitHubHistoryReader:
             "Accept": "application/vnd.github.v3+json",
             "X-GitHub-Api-Version": "2022-11-28",
         }
-        self._sleep = sleep
+        self._sleep = sleep if sleep is not None else time.sleep
         self._rate_limit_retries = max(rate_limit_retries, 0)
         self._max_backoff_seconds = max_backoff_seconds
         self._scope_checked = False
@@ -182,7 +183,12 @@ class GitHubHistoryReader:
     def __enter__(self) -> GitHubHistoryReader:
         return self
 
-    def __exit__(self, *exc: object) -> None:
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
         self.close()
 
     def _get(self, path: str, params: dict[str, str | int]) -> Sequence[Any]:

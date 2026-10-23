@@ -92,7 +92,6 @@ def test_copying_the_main_file_of_a_live_database_loses_the_newest_rows(
     outbox = TansekiOutbox(source_path)
     try:
         outbox.enqueue("e1", {"id": "d1"})
-        outbox._db.commit()
 
         copy_path = tmp_path / "copy.db"
         copy_path.write_bytes(source_path.read_bytes())  # what `cp outbox.db` does

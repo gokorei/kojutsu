@@ -29,6 +29,7 @@ import threading
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import TracebackType
 from typing import Any, ClassVar
 
 STATE_VERSION = 1
@@ -204,7 +205,12 @@ class WorkerState:
     def __enter__(self) -> WorkerState:
         return self
 
-    def __exit__(self, *exc: object) -> None:
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
         self.close()
 
     def __del__(self) -> None:  # pragma: no cover - best-effort release only

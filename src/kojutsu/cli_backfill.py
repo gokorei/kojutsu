@@ -11,6 +11,8 @@ from kojutsu.config import Settings
 from kojutsu.core.backfill import run_backfill
 from kojutsu.core.backfill_reviews import (
     MAX_OBJECTS_PER_RUN,
+    BackfillPlan,
+    BackfillReport,
     build_plan,
 )
 from kojutsu.core.backfill_reviews import run_backfill as run_review_backfill
@@ -122,6 +124,30 @@ def backfill(
 
 #: Cap on gaps listed per backfill run; the rest are counted, not shown.
 MAX_REPORTED_BACKFILL_GAPS = 20
+
+
+def _execute_review_backfill(
+    settings: Settings,
+    *,
+    repository: list[str],
+    since: str,
+    until: str | None,
+    max_objects: int,
+    authorized_associations: str,
+    pr: list[str] | None,
+) -> None:
+    """Validate the run's bounds, execute the plan, and print what it did."""
+    plan = _review_backfill_plan(
+        settings,
+        repository=repository,
+        since=since,
+        until=until,
+        max_objects=max_objects,
+        authorized_associations=authorized_associations,
+        pr=pr,
+    )
+    report = _run_review_backfill_plan(settings, plan)
+    _echo_review_backfill_report(plan, report)
 
 
 def backfill_reviews(
@@ -255,7 +281,7 @@ def backfill_reviews(
     settings = _settings()
     _require_github_token(settings)
 
-    plan = _review_backfill_plan(
+    _execute_review_backfill(
         settings,
         repository=repository,
         since=since,
@@ -264,8 +290,6 @@ def backfill_reviews(
         authorized_associations=authorized_associations,
         pr=pr,
     )
-    report = _run_review_backfill_plan(settings, plan)
-    _echo_review_backfill_report(plan, report)
 
 
 def _parse_pr_numbers(value: list[str] | None) -> list[int] | None:
@@ -305,7 +329,7 @@ def _review_backfill_plan(
     max_objects: int,
     authorized_associations: str,
     pr: list[str] | None = None,
-):
+) -> BackfillPlan:
     """Validate the run's three bounds, or exit naming the problem."""
     try:
         pr_numbers = _parse_pr_numbers(pr)
@@ -327,7 +351,7 @@ def _review_backfill_plan(
         raise typer.Exit(1) from None
 
 
-def _run_review_backfill_plan(settings: Settings, plan):
+def _run_review_backfill_plan(settings: Settings, plan: BackfillPlan) -> BackfillReport:
     """Execute the plan, translating transport failures into exit codes."""
     try:
         reader = GitHubHistoryReader(token=settings.github_token)
@@ -366,8 +390,8 @@ def _run_review_backfill_plan(settings: Settings, plan):
                 close()
 
 
-def _echo_review_backfill_report(plan, report) -> None:
-    """Print what the run did, and exit non-zero when the range is truncated."""
+def _echo_backfill_scope(plan: BackfillPlan, report: BackfillReport) -> None:
+    """Print the run's bounds and its per-object counts."""
     ceiling = f" until={plan.until.date().isoformat()}" if plan.until is not None else ""
     # The effective gate, always printed and not only when it was narrowed. The flag
     # replaces the policy rather than adding to it, so `--authorized-associations
@@ -401,38 +425,51 @@ def _echo_review_backfill_report(plan, report) -> None:
         # refused is review activity the corpus is discarding. An operator reading a
         # single number cannot tell which they have.
         typer.echo(f"  refused: {count:>6} {reason}")
+
+
+def _echo_backfill_gaps(report: BackfillReport) -> None:
+    """List the unreadable objects, counting rather than showing the rest."""
     for gap in report.gaps[:MAX_REPORTED_BACKFILL_GAPS]:
         location = f"{gap.repository}#{gap.pr_number if gap.pr_number is not None else '-'}"
         typer.echo(f"  gap: {location} {gap.what}: {gap.reason}")
     omitted = len(report.gaps) - MAX_REPORTED_BACKFILL_GAPS
     if omitted > 0:
         typer.echo(f"  ... and {omitted} more unreadable object(s) not listed")
-    if report.budget_exhausted:
-        # Named as a truncation, because a run that stopped at its bound and a run
-        # that finished the range report the same counts otherwise, and the whole
-        # cost of a truncated backfill is that it is indistinguishable from a
-        # complete one. The re-run it recommends is now true rather than
-        # misleading: what the store already holds is charged nothing, so the next
-        # run spends its budget further back instead of on the same page.
-        ceiling_hit = any("page ceiling" in gap.reason for gap in report.gaps)
+
+
+def _echo_backfill_truncation(report: BackfillReport) -> None:
+    """Name a budget stop as a truncation and say how to continue."""
+    # Named as a truncation, because a run that stopped at its bound and a run
+    # that finished the range report the same counts otherwise, and the whole
+    # cost of a truncated backfill is that it is indistinguishable from a
+    # complete one. The re-run it recommends is now true rather than
+    # misleading: what the store already holds is charged nothing, so the next
+    # run spends its budget further back instead of on the same page.
+    ceiling_hit = any("page ceiling" in gap.reason for gap in report.gaps)
+    typer.echo(
+        f"range: TRUNCATED — stored {report.objects_new} new object(s) of the "
+        f"{report.plan.max_objects} allowed, then stopped. This range is not complete.",
+        err=True,
+    )
+    if ceiling_hit:
         typer.echo(
-            f"range: TRUNCATED — stored {report.objects_new} new object(s) of the "
-            f"{report.plan.max_objects} allowed, then stopped. This range is not complete.",
+            "  a read also hit the page ceiling, which another identical run will hit "
+            "again: raise the window's bound or the page ceiling rather than re-running",
             err=True,
         )
-        if ceiling_hit:
-            typer.echo(
-                "  a read also hit the page ceiling, which another identical run will hit "
-                "again: raise the window's bound or the page ceiling rather than re-running",
-                err=True,
-            )
-        else:
-            typer.echo(
-                "  re-run the same range to continue; objects already stored are not charged "
-                "again, so it advances. It skips the pull requests earlier runs finished, "
-                "so expect listing reads without records.",
-                err=True,
-            )
+    else:
+        typer.echo(
+            "  re-run the same range to continue; objects already stored are not charged "
+            "again, so it advances. It skips the pull requests earlier runs finished, "
+            "so expect listing reads without records.",
+            err=True,
+        )
+
+
+def _echo_backfill_range_outcome(plan: BackfillPlan, report: BackfillReport) -> None:
+    """Name a truncated or floor-missing range, and exit non-zero for a truncation."""
+    if report.budget_exhausted:
+        _echo_backfill_truncation(report)
     elif report.objects_new == 0:
         typer.echo(
             "range: walked to its end; nothing new to store in it. A re-run of this range would "
@@ -470,6 +507,13 @@ def _echo_review_backfill_report(plan, report) -> None:
         # the same reason, and a truncated range that exits 0 is the failure this
         # report exists to name.
         raise typer.Exit(2)
+
+
+def _echo_review_backfill_report(plan: BackfillPlan, report: BackfillReport) -> None:
+    """Print what the run did, and exit non-zero when the range is truncated."""
+    _echo_backfill_scope(plan, report)
+    _echo_backfill_gaps(report)
+    _echo_backfill_range_outcome(plan, report)
 
 
 def register(app: typer.Typer) -> None:

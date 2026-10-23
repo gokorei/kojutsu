@@ -22,6 +22,9 @@ from kojutsu.integrations.github_models import IssueCommentPayload
 
 
 def patch_http(monkeypatch, handler) -> None:
+    from pytest_time.instant_sleep import InstantSleep
+
+    InstantSleep().install(monkeypatch)
     real_client = httpx.Client
 
     def factory(*args, **kwargs):

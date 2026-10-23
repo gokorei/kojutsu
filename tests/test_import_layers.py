@@ -2,8 +2,8 @@
 
 The intended shape is one-directional: entry points (``cli``, ``webhook``,
 ``worker``, ``mcp_server``) -> ``runtime`` -> ``core`` -> ``integrations`` ->
-leaves (``config``, ``models``, ``allowlist``, ``identity``, ``text_limits``,
-``webhook.urls``). The disease these tests prevent is a back-edge --
+leaves (``chapters``, ``config``, ``models``, ``allowlist``, ``identity``,
+``text_limits``, ``webhook.urls``). The disease these tests prevent is a back-edge --
 ``integrations`` importing ``core`` -- which once forced the layering to be
 held together by function-level imports. Every test here parses the AST, so a
 new edge fails the build rather than waiting for a reviewer to notice it.
@@ -25,6 +25,7 @@ INTEGRATIONS = SRC / "integrations"
 #: (``core``, ``runtime``, ``worker``, ``webhook``, tools) is a back-edge.
 _INTEGRATIONS_ALLOWLIST = frozenset(
     {
+        "kojutsu.chapters",
         "kojutsu.config",
         "kojutsu.models",
         "kojutsu.text_limits",
@@ -37,6 +38,7 @@ _INTEGRATIONS_ALLOWLIST = frozenset(
 #: Leaf modules and the internal imports each is allowed. A leaf that reaches
 #: outside this table is not a leaf, and whatever imports it inherits the edge.
 _LEAF_ALLOWLIST = {
+    "kojutsu.chapters": frozenset(),
     "kojutsu.config": frozenset(),
     "kojutsu.models": frozenset(),
     "kojutsu.allowlist": frozenset({"kojutsu.config"}),

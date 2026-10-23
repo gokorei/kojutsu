@@ -7,6 +7,7 @@ import logging
 import os
 import secrets
 import sqlite3
+import stat
 import threading
 import time
 from collections import deque
@@ -521,7 +522,7 @@ def _process_check_run(payload: CheckRunPayload, delivery_id: str | None) -> Web
     }
 
 
-def _head_sha(pull_request: Any) -> str | None:
+def _head_sha(pull_request: PullRequestPayload | None) -> str | None:
     """The commit the pull request head pointed at, or nothing.
 
     Free: it is already on the payload. It is the one half of the code anchor
@@ -1020,13 +1021,11 @@ async def _github_webhook_impl(
     """
     body = await _read_webhook_body(request)
     settings = get_settings()
-    if not settings.github_webhook_secret:
-        raise HTTPException(status_code=503, detail="Webhook authentication is not configured")
-    if not _verify_signature(body, x_hub_signature_256, settings.github_webhook_secret):
-        raise HTTPException(status_code=401, detail="Invalid signature")
-
+    _authenticate_delivery(body, x_hub_signature_256, settings)
     if x_github_event not in ACCEPTED_EVENTS:
         return {"status": "ignored", "event": x_github_event or "unknown"}
+    if not isinstance(x_github_event, str):
+        return {"status": "ignored", "event": "unknown"}
 
     # Every event is claimed through one path so that authorization and
     # deduplication cannot drift apart between event types. A review event
@@ -1035,19 +1034,7 @@ async def _github_webhook_impl(
     # signal was covered.
     tracker = _DeliveryTracker()
     try:
-        if x_github_event in ("pull_request_review", "pull_request_review_comment"):
-            return await _handle_review_event(
-                body, x_github_delivery, x_github_event, settings, tracker
-            )
-        if x_github_event == "check_run":
-            return await _handle_check_run_event(
-                body, x_github_delivery, x_github_event, settings, tracker
-            )
-        if x_github_event == "issue_comment":
-            return await _handle_issue_comment_event(
-                body, x_github_delivery, x_github_event, settings, tracker
-            )
-        return await _handle_pull_request_event(
+        return await _route_webhook_event(
             body, x_github_delivery, x_github_event, settings, tracker
         )
     except HTTPException:
@@ -1055,33 +1042,69 @@ async def _github_webhook_impl(
     except ValidationError as exc:
         raise HTTPException(status_code=422, detail="Invalid webhook payload") from exc
     except httpx.HTTPError as exc:
-        if tracker.delivery_id is not None and tracker.token is not None:
-            _release_delivery_after_failure(
-                tracker.delivery_id, tracker.token, "GitHub is unavailable"
-            )
-
+        _release_delivery_after_failure_if_claimed(tracker, "GitHub is unavailable")
         raise HTTPException(
             status_code=502,
             detail="GitHub is unavailable; retry the webhook delivery.",
             headers={"Retry-After": str(WEBHOOK_RETRY_AFTER_SECONDS)},
         ) from exc
     except ValueError as exc:
-        if tracker.delivery_id is not None and tracker.token is not None:
-            _release_delivery_after_failure(tracker.delivery_id, tracker.token, type(exc).__name__)
+        _release_delivery_after_failure_if_claimed(tracker, type(exc).__name__)
+        # Post-authentication: the caller presented a valid HMAC signature, so
+        # configuration details (TANSEKI_URL, allowlist) go to the delivery log
+        # rather than to a prober. The pre-auth paths above stay generic.
+        # ValueErrors here are config-shaped; DB internals surface as
+        # sqlite3.Error and take the generic branch below.
         raise HTTPException(
             status_code=503,
             detail=str(exc),
             headers={"Retry-After": str(WEBHOOK_RETRY_AFTER_SECONDS)},
         ) from exc
     except Exception as exc:
-        if tracker.delivery_id is not None and tracker.token is not None:
-            _release_delivery_after_failure(tracker.delivery_id, tracker.token, type(exc).__name__)
+        _release_delivery_after_failure_if_claimed(tracker, type(exc).__name__)
         logger.exception("Webhook processing failed", exc_info=exc)
         raise HTTPException(
             status_code=503,
             detail="Webhook processing failed; retry the delivery.",
             headers={"Retry-After": str(WEBHOOK_RETRY_AFTER_SECONDS)},
         ) from exc
+
+
+def _authenticate_delivery(body: bytes, signature: str | None, settings: Settings) -> None:
+    if not settings.github_webhook_secret:
+        logger.warning("Webhook delivery refused: webhook secret is not configured")
+        raise HTTPException(status_code=503, detail="Service Unavailable")
+    if not _verify_signature(body, signature, settings.github_webhook_secret):
+        raise HTTPException(status_code=401, detail="Invalid signature")
+
+
+def _release_delivery_after_failure_if_claimed(tracker: _DeliveryTracker, reason: str) -> None:
+    if tracker.delivery_id is not None and tracker.token is not None:
+        _release_delivery_after_failure(tracker.delivery_id, tracker.token, reason)
+
+
+async def _route_webhook_event(
+    body: bytes,
+    x_github_delivery: str | None,
+    x_github_event: str,
+    settings: Settings,
+    tracker: _DeliveryTracker,
+) -> WebhookResult:
+    if x_github_event in ("pull_request_review", "pull_request_review_comment"):
+        return await _handle_review_event(
+            body, x_github_delivery, x_github_event, settings, tracker
+        )
+    if x_github_event == "check_run":
+        return await _handle_check_run_event(
+            body, x_github_delivery, x_github_event, settings, tracker
+        )
+    if x_github_event == "issue_comment":
+        return await _handle_issue_comment_event(
+            body, x_github_delivery, x_github_event, settings, tracker
+        )
+    return await _handle_pull_request_event(
+        body, x_github_delivery, x_github_event, settings, tracker
+    )
 
 
 @router.get("/webhook/health")
@@ -1095,46 +1118,91 @@ def _sqlite_writable(path: str) -> bool:
     try:
         if not db_path.parent.exists():
             return False
-        if not os.access(db_path.parent, os.W_OK):
-            return False
         if not db_path.exists():
-            return True
+            # No TOCTOU-prone os.access probe: attempt to create the file
+            # exclusively via O_CREAT|O_EXCL in a probe, then remove it. If the
+            # directory is not writable this fails closed.
+            try:
+                fd = os.open(db_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            except FileExistsError:
+                pass
+            except OSError:
+                return False
+            else:
+                os.close(fd)
+                try:
+                    db_path.unlink()
+                except OSError:
+                    return False
+            return os.access(db_path.parent, os.W_OK)
+        # Verify the existing file without an access-then-open race: open the
+        # descriptor first (O_NOFOLLOW, no create), fstat it, then connect.
+        nofollow = getattr(os, "O_NOFOLLOW", 0)
+        try:
+            fd = os.open(db_path, os.O_RDWR | nofollow)
+        except OSError:
+            return False
+        try:
+            file_stat = os.fstat(fd)
+            if not stat.S_ISREG(file_stat.st_mode):
+                return False
+            if hasattr(os, "geteuid") and file_stat.st_uid != os.geteuid():
+                return False
+        finally:
+            os.close(fd)
         db = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=rw", uri=True, timeout=1)
         try:
             db.execute("PRAGMA query_only = ON")
             db.execute("PRAGMA schema_version").fetchone()
-        finally:
+        except (sqlite3.Error, ValueError):
             db.close()
-        return os.access(db_path, os.W_OK)
-    except (OSError, sqlite3.Error, ValueError):
+            return False
+        else:
+            db.close()
+            return True
+    except OSError:
         return False
 
 
 def _webhook_ready_sync(settings: Settings) -> WebhookResult:
+    # Unauthenticated readiness must not name which secret is missing: a LAN
+    # prober can otherwise enumerate configuration state. Log the specific
+    # cause server-side and return a generic body; the authed /webhook/status
+    # endpoint keeps the detailed breakdown.
     if not settings.github_token:
-        raise HTTPException(status_code=503, detail="GITHUB_TOKEN is not configured")
+        logger.warning("Readiness check failed: GITHUB_TOKEN is not configured")
+        raise HTTPException(status_code=503, detail="Service Unavailable")
     if not settings.github_webhook_secret:
-        raise HTTPException(status_code=503, detail="GITHUB_WEBHOOK_SECRET is not configured")
-    _require_repository_allowlist(settings)
+        logger.warning("Readiness check failed: GITHUB_WEBHOOK_SECRET is not configured")
+        raise HTTPException(status_code=503, detail="Service Unavailable")
+    try:
+        _require_repository_allowlist(settings)
+    except HTTPException as exc:
+        logger.warning("Readiness check failed: repository allowlist: %s", exc.detail)
+        raise HTTPException(status_code=503, detail="Service Unavailable") from exc
     if not settings.tanseki_enabled:
-        raise HTTPException(status_code=503, detail="Tanseki is not configured")
+        logger.warning("Readiness check failed: Tanseki is not configured")
+        raise HTTPException(status_code=503, detail="Service Unavailable")
     if not all(
         (
             _sqlite_writable(settings.kojutsu_registry_path),
             _sqlite_writable(settings.tanseki_outbox_path),
         )
     ):
-        raise HTTPException(status_code=503, detail="Local SQLite storage is not writable")
+        logger.warning("Readiness check failed: local SQLite storage is not writable")
+        raise HTTPException(status_code=503, detail="Service Unavailable")
     try:
         runtime = get_runtime()
         runtime_status = runtime.status()
     except OutboxOwnershipError as exc:
-        raise HTTPException(status_code=503, detail="Outbox is owned by another process") from exc
+        logger.warning("Readiness check failed: outbox owned by another process")
+        raise HTTPException(status_code=503, detail="Service Unavailable") from exc
     except Exception as exc:
         logger.warning("Webhook runtime readiness check failed: %s", type(exc).__name__)
-        raise HTTPException(status_code=503, detail="Webhook runtime is unavailable") from exc
+        raise HTTPException(status_code=503, detail="Service Unavailable") from exc
     if not runtime_status.get("tanseki_reachable", False):
-        raise HTTPException(status_code=503, detail="Tanseki is unavailable")
+        logger.warning("Readiness check failed: Tanseki is unavailable")
+        raise HTTPException(status_code=503, detail="Service Unavailable")
     return {
         "status": "ready",
         "service": "kojutsu-webhook",
@@ -1158,7 +1226,8 @@ def _tanseki_reachable(settings: Settings) -> bool:
 
 def _require_status_auth(secret: str, authorization: str | None) -> None:
     if not secret:
-        raise HTTPException(status_code=503, detail="Status authentication is not configured")
+        logger.warning("Status check refused: status authentication is not configured")
+        raise HTTPException(status_code=503, detail="Service Unavailable")
     scheme, _, token = (authorization or "").partition(" ")
     if scheme.casefold() != "bearer" or not secrets.compare_digest(token, secret):
         raise HTTPException(
@@ -1203,5 +1272,5 @@ async def webhook_status(
 ) -> dict[str, Any]:
     """Get protected webhook status information without blocking the event loop."""
     settings = get_settings()
-    _require_status_auth(settings.github_webhook_secret, authorization)
+    _require_status_auth(settings.status_auth_token, authorization)
     return await asyncio.to_thread(_webhook_status_sync, settings, _configured_webhook_url(request))

@@ -13,6 +13,7 @@ from pathlib import Path
 from queue import Empty
 
 import pytest
+from tests.support import execute_write, table_columns, user_version
 
 import kojutsu.core.outbox as outbox_module
 from kojutsu.core.outbox import (
@@ -195,11 +196,11 @@ def test_transient_failure_is_scheduled_and_permanent_failure_is_dead_lettered(
         assert relay(outbox, client).failed == 1
         assert outbox.ready() == []
         assert outbox.status_counts()["retrying"] == 1
-        outbox._db.execute("UPDATE outbox SET next_attempt_at = '2000-01-01T00:00:00+00:00'")
-        outbox._db.commit()
+        execute_write(
+            outbox.path, "UPDATE outbox SET next_attempt_at = '2000-01-01T00:00:00+00:00'"
+        )
         assert len(outbox.ready()) == 1
-        outbox._db.execute("DELETE FROM outbox WHERE entry_id = 'retry'")
-        outbox._db.commit()
+        execute_write(outbox.path, "DELETE FROM outbox WHERE entry_id = 'retry'")
 
         outbox.enqueue("dead", {"id": "dead"})
         client.error = _PermanentFailureError("invalid")
@@ -296,10 +297,11 @@ def test_dead_letter_retention_requires_explicit_safe_cleanup(tmp_path: Path) ->
         outbox.enqueue("e1", {"id": "d1"})
         outbox.mark_failed("e1", TansekiPermanentError("invalid payload"))
         expired = (datetime.now(UTC) - timedelta(days=31)).isoformat()
-        outbox._db.execute(
-            "UPDATE outbox SET dead_lettered_at = ?, updated_at = ?", (expired, expired)
+        execute_write(
+            outbox.path,
+            "UPDATE outbox SET dead_lettered_at = ?, updated_at = ?",
+            (expired, expired),
         )
-        outbox._db.commit()
 
     with TansekiOutbox(path) as reopened:
         assert [item.entry_id for item in reopened.dead_letters()] == ["e1"]
@@ -313,14 +315,14 @@ def test_dead_letter_cleanup_preserves_an_entry_with_a_lease(tmp_path: Path) -> 
         outbox.enqueue("leased", {"id": "leased"})
         outbox.mark_failed("leased", TansekiPermanentError("invalid"))
         expired = (datetime.now(UTC) - timedelta(days=31)).isoformat()
-        outbox._db.execute(
+        execute_write(
+            outbox.path,
             """
             UPDATE outbox SET dead_lettered_at = ?, updated_at = ?,
                 lease_token = 'operator-lease', lease_expires_at = ?
             """,
             (expired, expired, expired),
         )
-        outbox._db.commit()
 
         assert outbox.cleanup_dead_letters(retention_days=30) == 0
         assert [item.entry_id for item in outbox.dead_letters()] == ["leased"]
@@ -344,9 +346,8 @@ def test_outbox_migration_is_versioned_and_adds_pending_payload(tmp_path: Path) 
         )
 
     with TansekiOutbox(path) as outbox:
-        columns = {row[1] for row in outbox._db.execute("PRAGMA table_info(outbox)")}
-        assert "pending_payload" in columns
-        assert outbox._db.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert "pending_payload" in table_columns(outbox.path, "outbox")
+        assert user_version(outbox.path) == 2
 
 
 def test_outbox_migration_failure_rolls_back_atomically(
@@ -384,7 +385,7 @@ def test_outbox_migration_failure_rolls_back_atomically(
 
     monkeypatch.setattr(outbox_module, "_validate_schema", original_validate)
     with TansekiOutbox(path) as outbox:
-        assert outbox._db.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert user_version(outbox.path) == 2
 
 
 def test_outbox_and_owner_lock_are_owner_only(tmp_path: Path) -> None:

@@ -14,6 +14,9 @@ from kojutsu.integrations.jira_client import (
 
 
 def _mock_jira(monkeypatch, response: httpx.Response) -> None:
+    from pytest_time.instant_sleep import InstantSleep
+
+    InstantSleep().install(monkeypatch)
     import kojutsu.integrations.jira_client as module
 
     real_client = module.httpx.Client

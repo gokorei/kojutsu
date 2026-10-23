@@ -19,6 +19,7 @@ from pathlib import Path
 import httpx
 import pytest
 from fastapi.testclient import TestClient
+from tests.support import query_value
 
 from kojutsu import runtime as runtime_module
 from kojutsu.core.knowledge_sink import (
@@ -102,7 +103,7 @@ def _webhook_runtime(
 ) -> tuple[SqliteQuestionRegistry, RecordingSink]:
     registry = SqliteQuestionRegistry(tmp_path / "r.db")
     sink = RecordingSink(status)
-    monkeypatch.setattr(runtime_module, "_runtime", FakeRuntime(registry, sink))
+    runtime_module.install_runtime(FakeRuntime(registry, sink))
     monkeypatch.setenv("GITHUB_TOKEN", "x")
     monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", WEBHOOK_SECRET)
     return registry, sink
@@ -318,9 +319,11 @@ def test_an_observation_that_dead_letters_is_surfaced_and_holds_the_delivery(
     assert response.status_code == 503
     assert response.headers["Retry-After"] == "5"
     assert (
-        registry._db.execute(
-            "SELECT status FROM webhook_deliveries WHERE delivery_id = ?", (DELIVERY_ID,)
-        ).fetchone()[0]
+        query_value(
+            registry.path,
+            "SELECT status FROM webhook_deliveries WHERE delivery_id = ?",
+            (DELIVERY_ID,),
+        )
         == "retryable"
     )
 
@@ -409,9 +412,11 @@ def test_a_review_observation_that_dead_letters_holds_the_delivery(tmp_path, mon
     assert response.status_code == 503
     assert response.headers["Retry-After"] == "5"
     assert (
-        registry._db.execute(
-            "SELECT status FROM webhook_deliveries WHERE delivery_id = ?", (DELIVERY_ID,)
-        ).fetchone()[0]
+        query_value(
+            registry.path,
+            "SELECT status FROM webhook_deliveries WHERE delivery_id = ?",
+            (DELIVERY_ID,),
+        )
         == "retryable"
     )
 

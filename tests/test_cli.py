@@ -603,18 +603,19 @@ def test_search_requires_tanseki() -> None:
 
 def test_search_renders_mocked_results(monkeypatch) -> None:
     class FakeTansekiClient:
-        def search(self, text, *, tags=None, frontmatter=None, limit=20):
+        def search_documents(self, text, *, tags=None, frontmatter=None, limit=20):
             assert text == "authentication"
             assert frontmatter == {"repo": "org/repo"}
             assert limit == 1
-            return [SimpleNamespace(id="doc-1")]
+            return [
+                SimpleNamespace(
+                    frontmatter={"repo": "org/repo", "pr": "7", "category": "design_decision"},
+                    content="Use short-lived tokens.",
+                )
+            ]
 
-        def get_document(self, doc_id):
-            assert doc_id == "doc-1"
-            return SimpleNamespace(
-                frontmatter={"repo": "org/repo", "pr": "7", "category": "design_decision"},
-                content="Use short-lived tokens.",
-            )
+        def close(self) -> None:
+            return None
 
     monkeypatch.setenv("TANSEKI_URL", "https://tanseki.test")
     monkeypatch.setattr(
@@ -753,6 +754,16 @@ def test_serve_requires_webhook_secret_for_public_host(monkeypatch) -> None:
     assert "GITHUB_WEBHOOK_SECRET" in result.output
 
 
+def test_public_serve_refuses_empty_allowlist(monkeypatch) -> None:
+    monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", "secret")
+    monkeypatch.setenv("GITHUB_WEBHOOK_ALLOWED_REPOSITORIES", "")
+
+    result = runner.invoke(app, ["serve", "--host", "0.0.0.0"])
+
+    assert result.exit_code == 1
+    assert "GITHUB_WEBHOOK_ALLOWED_REPOSITORIES" in result.output
+
+
 def test_public_serve_without_registration_does_not_validate_bind_as_webhook_url(
     monkeypatch,
 ) -> None:
@@ -769,6 +780,7 @@ def test_public_serve_without_registration_does_not_validate_bind_as_webhook_url
 
     monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", "secret")
     monkeypatch.setenv("GITHUB_WEBHOOK_REGISTER", "false")
+    monkeypatch.setenv("GITHUB_WEBHOOK_ALLOWED_REPOSITORIES", "org/repo")
     monkeypatch.setattr(webhook_module, "create_webhook_app", create_app)
     monkeypatch.setattr(uvicorn, "run", lambda *_args, **_kwargs: None)
 
@@ -791,6 +803,7 @@ def test_webhook_register_requires_secret_outside_dry_run(monkeypatch) -> None:
 def test_public_serve_requires_explicit_public_webhook_url(monkeypatch) -> None:
     monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", "secret")
     monkeypatch.setenv("GITHUB_WEBHOOK_REGISTER", "true")
+    monkeypatch.setenv("GITHUB_WEBHOOK_ALLOWED_REPOSITORIES", "org/repo")
 
     missing = runner.invoke(app, ["serve", "--host", "0.0.0.0"])
     local = runner.invoke(

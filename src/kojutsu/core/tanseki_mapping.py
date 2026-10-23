@@ -258,6 +258,12 @@ def build_frontmatter(entry: KnowledgeEntry) -> dict[str, Any]:
         "updated_at": entry.answered_at.isoformat(),
         "capture_source": entry.capture_source.value,
     }
+    _write_frontmatter_files(frontmatter, metadata)
+    _write_extras(frontmatter, _frontmatter_extra(entry, metadata))
+    return frontmatter
+
+
+def _write_frontmatter_files(frontmatter: dict[str, Any], metadata: dict[str, Any]) -> None:
     # ``files`` does not go through ``extra``, and the reason is no longer that a
     # list needs special handling -- ``_write_extras`` preserves a list perfectly
     # well now, so folding this in would not reproduce any defect. What is actually
@@ -315,7 +321,10 @@ def build_frontmatter(entry: KnowledgeEntry) -> dict[str, Any]:
         if len(files) > MAX_FRONTMATTER_FILES:
             bounded.append(f"{len(files) - MAX_FRONTMATTER_FILES} more files not listed")
         frontmatter[FILES_KEY] = bounded
-    extra = {
+
+
+def _frontmatter_extra(entry: KnowledgeEntry, metadata: dict[str, Any]) -> dict[str, Any]:
+    return {
         "category": entry.category.value,
         "repo": metadata.get("repo"),
         "pr": metadata.get("pr_number"),
@@ -412,8 +421,6 @@ def build_frontmatter(entry: KnowledgeEntry) -> dict[str, Any]:
         # happened, which is the opposite of what the ticket asked for.
         SANITISATION_KEY: metadata.get(SANITISATION_KEY),
     }
-    _write_extras(frontmatter, extra)
-    return frontmatter
 
 
 #: The body marker for a question no human asked. On its own line, in capitals, and

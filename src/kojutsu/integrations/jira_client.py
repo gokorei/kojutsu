@@ -5,12 +5,17 @@ from __future__ import annotations
 import ipaddress
 import logging
 import random
+import threading
 import time
 from collections.abc import Callable
-from typing import Any, TypedDict
+from types import TracebackType
+from typing import TYPE_CHECKING, Any, TypedDict
 from urllib.parse import urlparse
 
 import httpx
+
+if TYPE_CHECKING:
+    from kojutsu.config import Settings
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +51,32 @@ class JiraUnavailableError(JiraIntegrationError):
 
 class JiraPayloadError(JiraIntegrationError):
     """Jira returned an invalid issue response."""
+
+
+def jira_retry_after_seconds(response: httpx.Response) -> float | None:
+    """The wait Jira asked for, or ``None`` when it did not say."""
+    header = (response.headers.get("retry-after") or "").strip()
+    if not header:
+        return None
+    try:
+        return max(0.0, float(header))
+    except ValueError:
+        return None
+
+
+def jira_backoff(response: httpx.Response | None, attempt: int) -> float:
+    """Wait before the next attempt: the forge's ask first, else doubling.
+
+    Jittered so concurrent captures do not wake in lockstep, bounded so a
+    large ``Retry-After`` cannot park a capture behind a Jira outage.
+    """
+    requested = jira_retry_after_seconds(response) if response is not None else None
+    if requested is not None:
+        return min(requested, JIRA_MAX_BACKOFF_SECONDS)
+    return min(
+        float(2 ** max(attempt - 1, 0)) * random.uniform(0.5, 1.0),  # noqa: S311 - backoff jitter, not cryptographic
+        JIRA_MAX_BACKOFF_SECONDS,
+    )
 
 
 class JiraIssueFields(TypedDict):
@@ -108,7 +139,7 @@ class JiraClient:
         api_token: str,
         *,
         timeout_seconds: float = DEFAULT_JIRA_TIMEOUT_SECONDS,
-        sleep: Callable[[float], None] = time.sleep,
+        sleep: Callable[[float], None] | None = None,
     ) -> None:
         if timeout_seconds <= 0:
             raise ValueError("Jira timeout must be greater than zero.")
@@ -124,14 +155,12 @@ class JiraClient:
         self._auth = (username, api_token)
         self._timeout_seconds = min(timeout_seconds, MAX_JIRA_TIMEOUT_SECONDS)
         self._headers = {"Accept": "application/json", "Content-Type": "application/json"}
-        self._sleep = sleep
+        self._sleep = sleep if sleep is not None else time.sleep
         self._client: httpx.Client | None = None
-        import threading as _threading
-
-        self._client_lock = _threading.Lock()
+        self._client_lock = threading.Lock()
 
     @classmethod
-    def from_settings(cls, settings: Any) -> JiraClient:
+    def from_settings(cls, settings: Settings) -> JiraClient:
         """Build a client from application settings."""
         return cls(
             settings.jira_url,
@@ -163,36 +192,21 @@ class JiraClient:
     def __enter__(self) -> JiraClient:
         return self
 
-    def __exit__(self, *exc: object) -> None:
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
         self.close()
 
     def _url(self, path: str) -> str:
         return f"{self._base}/rest/api/3/{path.lstrip('/')}"
 
-    @staticmethod
-    def _retry_after_seconds(response: httpx.Response) -> float | None:
-        """The wait Jira asked for, or ``None`` when it did not say."""
-        header = (response.headers.get("retry-after") or "").strip()
-        if not header:
-            return None
-        try:
-            return max(0.0, float(header))
-        except ValueError:
-            return None
-
-    def _backoff(self, response: httpx.Response | None, attempt: int) -> float:
-        """Wait before the next attempt: the forge's ask first, else doubling.
-
-        Jittered so concurrent captures do not wake in lockstep, bounded so a
-        large ``Retry-After`` cannot park a capture behind a Jira outage.
-        """
-        requested = self._retry_after_seconds(response) if response is not None else None
-        if requested is not None:
-            return min(requested, JIRA_MAX_BACKOFF_SECONDS)
-        return min(
-            float(2 ** max(attempt - 1, 0)) * random.uniform(0.5, 1.0),  # noqa: S311 - backoff jitter, not cryptographic
-            JIRA_MAX_BACKOFF_SECONDS,
-        )
+    @property
+    def base_url(self) -> str:
+        """The normalized Jira base URL this client talks to."""
+        return self._base
 
     def get_issue(self, issue_key: str) -> dict[str, Any] | None:
         """Fetch an issue, retrying transient failures, or raise a safe domain error.
@@ -225,7 +239,7 @@ class JiraClient:
                     raise JiraUnavailableError(
                         "Jira is unavailable; retry or verify JIRA_URL."
                     ) from exc
-                self._sleep(self._backoff(None, attempt))
+                self._sleep(jira_backoff(None, attempt))
                 continue
             if response.status_code == 404:
                 return None
@@ -236,7 +250,7 @@ class JiraClient:
             if response.status_code == 429 or response.status_code >= 500:
                 if attempt >= JIRA_MAX_ATTEMPTS:
                     raise JiraUnavailableError("Jira is unavailable; retry later.")
-                self._sleep(self._backoff(response, attempt))
+                self._sleep(jira_backoff(response, attempt))
                 continue
             if response.status_code >= 400:
                 raise JiraIntegrationError(

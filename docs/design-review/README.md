@@ -38,6 +38,7 @@ and in the code.
 | [`identity-and-limits.md`](identity-and-limits.md) | What a content digest does and does not prove, and how to keep a limitation from becoming an implied promise |
 | [`rationale.md`](rationale.md) | Why stated decision rationale is captured and chain-of-thought is not, and the three claims that keep a self-asserted reason from reading as evidence |
 | [`record-structure.md`](record-structure.md) | Why a second axis answers "was this pairing established or inferred", and what it does not claim |
+| [`chapters-and-prologue.md`](chapters-and-prologue.md) | Why questions are generated from a chaptered map and the author's account, and what neither claim means |
 | [`clarification.md`](clarification.md) | Why a human statement that answered no question gets its own record, and why its trust runs opposite to a rationale's |
 | [`thread-classifier.md`](thread-classifier.md) | Why a comment thread has three outcomes and the third is the design, and why an uncertain model is allowed to decline |
 | [`open-questions.md`](open-questions.md) | The reasoning behind the work not yet done |

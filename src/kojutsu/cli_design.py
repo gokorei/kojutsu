@@ -634,6 +634,47 @@ def _require_design_store_paths(settings: Settings) -> None:
             )
 
 
+def _dispatch_design(
+    settings: Settings,
+    *,
+    repo: str,
+    topic: str,
+    proposer: list[str] | None,
+    reconciled_by: str | None,
+    revision: int,
+    approve: bool,
+    approved_by: str | None,
+    note: str | None,
+    plan_file: Path | None,
+) -> None:
+    """Route one invocation to its resume or capture phase."""
+    _require_design_repository(repo, settings)
+    if approve:
+        _run_design_resume(
+            settings,
+            repo=repo,
+            topic=topic,
+            proposer=proposer,
+            reconciled_by=reconciled_by,
+            revision=revision,
+            approved_by=approved_by,
+            note=note,
+            plan_file=plan_file,
+        )
+        return
+    _run_design_capture(
+        settings,
+        repo=repo,
+        topic=topic,
+        proposer=proposer,
+        reconciled_by=reconciled_by,
+        revision=revision,
+        approved_by=approved_by,
+        note=note,
+        plan_file=plan_file,
+    )
+
+
 def design(
     repo: str = typer.Option(
         ...,
@@ -763,27 +804,14 @@ def design(
     """
     settings = _settings()
     try:
-        _require_design_repository(repo, settings)
-        if approve:
-            _run_design_resume(
-                settings,
-                repo=repo,
-                topic=topic,
-                proposer=proposer,
-                reconciled_by=reconciled_by,
-                revision=revision,
-                approved_by=approved_by,
-                note=note,
-                plan_file=plan_file,
-            )
-            return
-        _run_design_capture(
+        _dispatch_design(
             settings,
             repo=repo,
             topic=topic,
             proposer=proposer,
             reconciled_by=reconciled_by,
             revision=revision,
+            approve=approve,
             approved_by=approved_by,
             note=note,
             plan_file=plan_file,
@@ -1026,6 +1054,133 @@ def _require_resume_flags(
         )
 
 
+def _refuse_recorded_reconciliation(
+    *,
+    repo: str,
+    topic: str,
+    reconciled_by: str,
+    revision: int,
+    registry: QuestionRegistry,
+) -> str:
+    """Return this run's anchor, or refuse when that reconciliation already stands."""
+    # The anchor *this* run would claim, not "the topic has something". Scoping the
+    # refusal to the anchor is what makes `--revision` usable at all: the identity is
+    # (topic, reconciler, revision), so a second judgement by the same reconciler at the
+    # next revision is a different record, and refusing on "anything exists" would make
+    # the option the refusal recommends impossible to take.
+    anchor = stable_design_reconciliation_id(
+        repo=repo, topic=topic, reconciled_by=reconciled_by, revision=revision
+    )
+    already = [
+        item
+        for item in find_design_reconciliations(repo=repo, topic=topic, registry=registry)
+        if item.entry_id == anchor
+    ]
+    if already:
+        taken = already[0]
+        others = [
+            item
+            for item in find_design_reconciliations(repo=repo, topic=topic, registry=registry)
+            if item.entry_id != anchor
+        ]
+        raise ValueError(
+            f"Reconciliation {taken.entry_id} is already recorded for repository "
+            f"{repo!r} on design topic {topic!r} -- by {taken.reconciled_by!r} at "
+            f"revision {taken.revision}, plan digest {taken.plan_sha256}"
+            + (
+                f" ({len(others)} other reconciliation(s) are also recorded for this "
+                f"topic, so approving it will need --reconciliation-id.)"
+                if others
+                else "."
+            )
+            + " This run will not reconcile again: a reconciler is a model, so a second "
+            "run produces a different plan -- creating one plan's tickets under an "
+            "approval read against the other, or refusing for a change nobody made. "
+            "Approve the recorded one with --approve --approved-by NAME, or record a "
+            "genuinely different judgement with --revision N."
+        )
+    return anchor
+
+
+def _capture_proposal_panel(
+    *,
+    propose: DesignProposer,
+    settings: Settings,
+    repo: str,
+    topic: str,
+    proposers: Sequence[str],
+    reconciled_by: str,
+    stores: _DesignDependencies,
+) -> tuple[ProposalCaptureOutcome, ...]:
+    """Capture each proposer's argument and check the reconciler's independence."""
+    captured = tuple(
+        capture_design_proposal(
+            repo=repo,
+            topic=topic,
+            principal=principal,
+            model=settings.llm_model,
+            text=propose(repo=repo, topic=topic, principal=principal),
+            registry=stores.registry,
+            sink=stores.sink,
+        )
+        for principal in proposers
+    )
+    proposals = [capture.proposal for capture in captured]
+    # Before the reconciler is called, so a self-approval costs no model call, and
+    # over every proposal so discarding one cannot excuse being one of them.
+    check_reconciler_independence(reconciled_by, proposals)
+    return captured
+
+
+def _reconcile_store_and_report(
+    *,
+    reconcile: DesignReconciler,
+    settings: Settings,
+    repo: str,
+    topic: str,
+    reconciled_by: str,
+    revision: int,
+    captured: tuple[ProposalCaptureOutcome, ...],
+    plan_file: Path | None,
+    stores: _DesignDependencies,
+) -> None:
+    """Reconcile the panel once, persist the plan, gate it, and print the review."""
+    proposals = [capture.proposal for capture in captured]
+    payload = reconcile(repo=repo, topic=topic, proposals=captured)
+    plan_payload, discarded = _design_plan_payload(payload, proposals)
+    reconciliation = reconcile_design_proposals(
+        repo=repo,
+        topic=topic,
+        reconciled_by=reconciled_by,
+        model=settings.llm_model,
+        proposals=proposals,
+        plan_payload=plan_payload,
+        discarded=discarded,
+        registry=stores.registry,
+        sink=stores.sink,
+        revision=revision,
+    )
+    path = _write_design_plan(
+        settings,
+        plan=reconciliation.plan,
+        entry_id=reconciliation.entry_id,
+        plan_file=plan_file,
+    )
+    block = _gate_the_unapproved_plan(
+        plan=reconciliation.plan, reconciliation=reconciliation, stores=stores
+    )
+    _echo_design_review(
+        repo=repo,
+        topic=topic,
+        reconciler=reconciled_by,
+        captures=captured,
+        reconciliation=reconciliation,
+        block=block,
+        plan_path=path,
+        settings=settings,
+    )
+
+
 def _capture_design(
     settings: Settings,
     *,
@@ -1067,96 +1222,32 @@ def _capture_design(
     propose = _design_proposer(settings)
     reconcile = _design_reconciler(settings)
     with _design_dependencies(settings) as stores:
-        # The anchor *this* run would claim, not "the topic has something". Scoping the
-        # refusal to the anchor is what makes `--revision` usable at all: the identity is
-        # (topic, reconciler, revision), so a second judgement by the same reconciler at the
-        # next revision is a different record, and refusing on "anything exists" would make
-        # the option the refusal recommends impossible to take.
-        anchor = stable_design_reconciliation_id(
-            repo=repo, topic=topic, reconciled_by=reconciled_by, revision=revision
-        )
-        already = [
-            item
-            for item in find_design_reconciliations(
-                repo=repo, topic=topic, registry=stores.registry
-            )
-            if item.entry_id == anchor
-        ]
-        if already:
-            taken = already[0]
-            others = [
-                item
-                for item in find_design_reconciliations(
-                    repo=repo, topic=topic, registry=stores.registry
-                )
-                if item.entry_id != anchor
-            ]
-            raise ValueError(
-                f"Reconciliation {taken.entry_id} is already recorded for repository "
-                f"{repo!r} on design topic {topic!r} -- by {taken.reconciled_by!r} at "
-                f"revision {taken.revision}, plan digest {taken.plan_sha256}"
-                + (
-                    f" ({len(others)} other reconciliation(s) are also recorded for this "
-                    f"topic, so approving it will need --reconciliation-id.)"
-                    if others
-                    else "."
-                )
-                + " This run will not reconcile again: a reconciler is a model, so a second "
-                "run produces a different plan -- creating one plan's tickets under an "
-                "approval read against the other, or refusing for a change nobody made. "
-                "Approve the recorded one with --approve --approved-by NAME, or record a "
-                "genuinely different judgement with --revision N."
-            )
-
-        captured = tuple(
-            capture_design_proposal(
-                repo=repo,
-                topic=topic,
-                principal=principal,
-                model=settings.llm_model,
-                text=propose(repo=repo, topic=topic, principal=principal),
-                registry=stores.registry,
-                sink=stores.sink,
-            )
-            for principal in proposers
-        )
-        proposals = [capture.proposal for capture in captured]
-        # Before the reconciler is called, so a self-approval costs no model call, and
-        # over every proposal so discarding one cannot excuse being one of them.
-        check_reconciler_independence(reconciled_by, proposals)
-
-        payload = reconcile(repo=repo, topic=topic, proposals=captured)
-        plan_payload, discarded = _design_plan_payload(payload, proposals)
-        reconciliation = reconcile_design_proposals(
+        _refuse_recorded_reconciliation(
             repo=repo,
             topic=topic,
             reconciled_by=reconciled_by,
-            model=settings.llm_model,
-            proposals=proposals,
-            plan_payload=plan_payload,
-            discarded=discarded,
-            registry=stores.registry,
-            sink=stores.sink,
             revision=revision,
+            registry=stores.registry,
         )
-        path = _write_design_plan(
-            settings,
-            plan=reconciliation.plan,
-            entry_id=reconciliation.entry_id,
-            plan_file=plan_file,
-        )
-        block = _gate_the_unapproved_plan(
-            plan=reconciliation.plan, reconciliation=reconciliation, stores=stores
-        )
-        _echo_design_review(
+        captured = _capture_proposal_panel(
+            propose=propose,
+            settings=settings,
             repo=repo,
             topic=topic,
-            reconciler=reconciled_by,
-            captures=captured,
-            reconciliation=reconciliation,
-            block=block,
-            plan_path=path,
+            proposers=proposers,
+            reconciled_by=reconciled_by,
+            stores=stores,
+        )
+        _reconcile_store_and_report(
+            reconcile=reconcile,
             settings=settings,
+            repo=repo,
+            topic=topic,
+            reconciled_by=reconciled_by,
+            revision=revision,
+            captured=captured,
+            plan_file=plan_file,
+            stores=stores,
         )
     # Raised outside the `with` so the stores are closed before the process reports the
     # outcome, and as its own exit code so a script can tell "gated" from both "done" and
@@ -1538,6 +1629,110 @@ def _read_design_plan(path: Path) -> DesignPlan:
         ) from None
 
 
+def _echo_design_review_header(
+    *,
+    repo: str,
+    topic: str,
+    reconciler: str,
+    captures: Sequence[ProposalCaptureOutcome],
+    reconciliation: ReconciliationOutcome,
+    plan_path: Path,
+    settings: Settings,
+) -> None:
+    """Print the record's identity and the panel it judged."""
+    typer.echo(f"design: {repo} topic={topic}")
+    typer.echo(f"reconciler: {reconciler} model={settings.llm_model or 'unstated'}")
+    typer.echo(f"reconciliation: {reconciliation.entry_id}")
+    typer.echo(f"plan-digest: {reconciliation.plan_sha256}")
+    typer.echo(f"plan-artifact: {plan_path}")
+    typer.echo(f"proposals: {len(captures)} captured as records")
+    for capture in captures:
+        typer.echo(
+            f"  - {capture.entry_id} by {capture.proposal.principal!r} "
+            f"model={capture.proposal.model or 'unstated'} "
+            f"{'captured' if capture.captured else 'already captured'}"
+        )
+    typer.echo("")
+
+
+def _echo_design_decisions(plan: DesignPlan) -> None:
+    """Print the goals and every decision with its rationale and rejected alternatives."""
+    typer.echo(f"goals ({len(plan.goals)}):")
+    for goal in plan.goals:
+        typer.echo(f"  - {goal}")
+    typer.echo("")
+    typer.echo(f"decisions ({len(plan.decisions)}):")
+    for position, decision in enumerate(plan.decisions, start=1):
+        typer.echo(f"  {position}. {decision.summary}")
+        typer.echo(f"     rationale: {decision.rationale}")
+        if decision.alternatives_rejected:
+            typer.echo("     rejected alternatives:")
+            for alternative in decision.alternatives_rejected:
+                typer.echo(f"       - {alternative.alternative}: {alternative.why_rejected}")
+        else:
+            typer.echo("     rejected alternatives: none stated")
+    typer.echo("")
+
+
+def _echo_design_discards(reconciliation: ReconciliationOutcome) -> None:
+    """Print what was considered and thrown away, with each reason."""
+    typer.echo(f"discarded proposals ({len(reconciliation.discarded)}):")
+    if reconciliation.discarded:
+        for discard in reconciliation.discarded:
+            typer.echo(
+                f"  - by {discard.proposal.principal!r} at revision "
+                f"{discard.proposal.revision}: {discard.reason}"
+            )
+    else:
+        typer.echo("  none; every proposal was read and none was discarded")
+    typer.echo("")
+
+
+def _echo_design_drafts(plan: DesignPlan) -> None:
+    """Print every draft in creation order with its dependency edges."""
+    ordered = ticket_drafts_in_dependency_order(plan)
+    typer.echo(f"ticket drafts ({len(ordered)}), in creation order:")
+    for position, draft in enumerate(ordered, start=1):
+        typer.echo(f"  {position}. [{draft.id}] {draft.title} ({draft.priority})")
+        typer.echo(
+            "     depends on: " + (", ".join(draft.depends_on) if draft.depends_on else "nothing")
+        )
+        typer.echo(f"     description: {draft.description}")
+        typer.echo("     acceptance criteria:")
+        for criterion in draft.acceptance_criteria:
+            typer.echo(f"       - {criterion}")
+        if draft.test_command:
+            typer.echo(f"     test command: {draft.test_command}")
+        if draft.reference_files:
+            typer.echo(f"     reference files: {', '.join(draft.reference_files)}")
+        if draft.labels:
+            typer.echo(f"     labels: {', '.join(draft.labels)}")
+    typer.echo("")
+
+
+def _echo_design_gate(
+    *,
+    block: PlanApprovalRequiredError,
+    settings: Settings,
+    repo: str,
+    topic: str,
+) -> None:
+    """Print the recorded gate block and the resume command that spends it."""
+    typer.echo(
+        f"tickets-created: 0. The plan-approval gate blocked it at PLAN_PROPOSED, and the "
+        f"decision was recorded before the refusal in "
+        f"{settings.design_plan_approval_ledger_path}."
+    )
+    for decision in block.decisions:
+        if decision.blocks:
+            typer.echo(f"  gate {decision.gate}: {decision.reason}")
+    typer.echo(
+        f"awaiting-approval: exit {DESIGN_GATED_EXIT_CODE}. Read the reconciliation above, "
+        "then create the tickets with:"
+    )
+    typer.echo(f"  kojutsu design --repo {repo} --topic {topic!r} --approve --approved-by NAME")
+
+
 def _echo_design_review(
     *,
     repo: str,
@@ -1571,75 +1766,19 @@ def _echo_design_review(
     something against it.
     """
     plan = reconciliation.plan
-    typer.echo(f"design: {repo} topic={topic}")
-    typer.echo(f"reconciler: {reconciler} model={settings.llm_model or 'unstated'}")
-    typer.echo(f"reconciliation: {reconciliation.entry_id}")
-    typer.echo(f"plan-digest: {reconciliation.plan_sha256}")
-    typer.echo(f"plan-artifact: {plan_path}")
-    typer.echo(f"proposals: {len(captures)} captured as records")
-    for capture in captures:
-        typer.echo(
-            f"  - {capture.entry_id} by {capture.proposal.principal!r} "
-            f"model={capture.proposal.model or 'unstated'} "
-            f"{'captured' if capture.captured else 'already captured'}"
-        )
-    typer.echo("")
-    typer.echo(f"goals ({len(plan.goals)}):")
-    for goal in plan.goals:
-        typer.echo(f"  - {goal}")
-    typer.echo("")
-    typer.echo(f"decisions ({len(plan.decisions)}):")
-    for position, decision in enumerate(plan.decisions, start=1):
-        typer.echo(f"  {position}. {decision.summary}")
-        typer.echo(f"     rationale: {decision.rationale}")
-        if decision.alternatives_rejected:
-            typer.echo("     rejected alternatives:")
-            for alternative in decision.alternatives_rejected:
-                typer.echo(f"       - {alternative.alternative}: {alternative.why_rejected}")
-        else:
-            typer.echo("     rejected alternatives: none stated")
-    typer.echo("")
-    typer.echo(f"discarded proposals ({len(reconciliation.discarded)}):")
-    if reconciliation.discarded:
-        for discard in reconciliation.discarded:
-            typer.echo(
-                f"  - by {discard.proposal.principal!r} at revision "
-                f"{discard.proposal.revision}: {discard.reason}"
-            )
-    else:
-        typer.echo("  none; every proposal was read and none was discarded")
-    typer.echo("")
-    ordered = ticket_drafts_in_dependency_order(plan)
-    typer.echo(f"ticket drafts ({len(ordered)}), in creation order:")
-    for position, draft in enumerate(ordered, start=1):
-        typer.echo(f"  {position}. [{draft.id}] {draft.title} ({draft.priority})")
-        typer.echo(
-            "     depends on: " + (", ".join(draft.depends_on) if draft.depends_on else "nothing")
-        )
-        typer.echo(f"     description: {draft.description}")
-        typer.echo("     acceptance criteria:")
-        for criterion in draft.acceptance_criteria:
-            typer.echo(f"       - {criterion}")
-        if draft.test_command:
-            typer.echo(f"     test command: {draft.test_command}")
-        if draft.reference_files:
-            typer.echo(f"     reference files: {', '.join(draft.reference_files)}")
-        if draft.labels:
-            typer.echo(f"     labels: {', '.join(draft.labels)}")
-    typer.echo("")
-    typer.echo(
-        f"tickets-created: 0. The plan-approval gate blocked it at PLAN_PROPOSED, and the "
-        f"decision was recorded before the refusal in "
-        f"{settings.design_plan_approval_ledger_path}."
+    _echo_design_review_header(
+        repo=repo,
+        topic=topic,
+        reconciler=reconciler,
+        captures=captures,
+        reconciliation=reconciliation,
+        plan_path=plan_path,
+        settings=settings,
     )
-    for decision in block.decisions:
-        if decision.blocks:
-            typer.echo(f"  gate {decision.gate}: {decision.reason}")
-    typer.echo(
-        f"awaiting-approval: exit {DESIGN_GATED_EXIT_CODE}. Read the reconciliation above, "
-        "then create the tickets with:"
-    )
-    typer.echo(f"  kojutsu design --repo {repo} --topic {topic!r} --approve --approved-by NAME")
+    _echo_design_decisions(plan)
+    _echo_design_discards(reconciliation)
+    _echo_design_drafts(plan)
+    _echo_design_gate(block=block, settings=settings, repo=repo, topic=topic)
 
 
 def _echo_design_resume(

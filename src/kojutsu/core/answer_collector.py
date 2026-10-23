@@ -799,6 +799,44 @@ def _review_context(
     an unauthorised reviewer and a missing account are ordinary outcomes the
     caller reports, and the census path distinguishes them by name.
     """
+    refusal = _review_admission(
+        repo=repo,
+        pr_number=pr_number,
+        review_author_association=review_author_association,
+        authorized_associations=authorized_associations,
+    )
+    if refusal is not None:
+        return refusal
+    if not review_author:
+        return ReviewCaptureResult(
+            outcomes=[], already_stored=False, refusal=REVIEW_REFUSAL_NO_ACCOUNT
+        )
+    return _review_identity(
+        repo=repo,
+        pr_number=pr_number,
+        review_id=review_id,
+        review_author=review_author,
+        review_submitted_at=review_submitted_at,
+        delivery_id=delivery_id,
+        pr_author_account=pr_author_account,
+        review_body=review_body,
+        review_state=review_state,
+        review_author_type=review_author_type,
+        pr_opened_at=pr_opened_at,
+        head_sha=head_sha,
+        files_changed=files_changed,
+        review_author_association=review_author_association,
+    )
+
+
+def _review_admission(
+    *,
+    repo: str,
+    pr_number: int,
+    review_author_association: str | None,
+    authorized_associations: frozenset[str] | None,
+) -> ReviewCaptureResult | None:
+    """The admission gates, or None when the review may be captured."""
     if not repo or pr_number == 0:
         return ReviewCaptureResult(
             outcomes=[], already_stored=False, refusal=REVIEW_REFUSAL_NO_CHANGE
@@ -817,11 +855,27 @@ def _review_context(
         return ReviewCaptureResult(
             outcomes=[], already_stored=False, refusal=REVIEW_REFUSAL_ASSOCIATION
         )
-    if not review_author:
-        return ReviewCaptureResult(
-            outcomes=[], already_stored=False, refusal=REVIEW_REFUSAL_NO_ACCOUNT
-        )
+    return None
 
+
+def _review_identity(
+    *,
+    repo: str,
+    pr_number: int,
+    review_id: int,
+    review_author: str,
+    review_submitted_at: datetime | None,
+    delivery_id: str | None,
+    pr_author_account: str | None,
+    review_body: str,
+    review_state: str,
+    review_author_type: str | None,
+    pr_opened_at: datetime | None,
+    head_sha: str | None,
+    files_changed: list[str] | None,
+    review_author_association: str | None,
+) -> _ReviewContext:
+    """Sanitise the body and derive the reviewing principal and independence."""
     # Captured prose reaches this function through two doors, and both are closed here,
     # before anything reads the text, so the emptiness test, the length bound and the
     # stored body are three views of one value rather than three that can disagree --
@@ -839,7 +893,44 @@ def _review_context(
     # the extractors would have removed survives the wider pass.
     review_body_field = sanitise(review_body)
     clean_body = review_body_field.text
+    association = review_author_association.strip().upper() if review_author_association else None
+    return _review_identity_from_clean(
+        repo=repo,
+        pr_number=pr_number,
+        review_id=review_id,
+        review_author=review_author,
+        review_submitted_at=review_submitted_at,
+        delivery_id=delivery_id,
+        pr_author_account=pr_author_account,
+        association=association,
+        clean_body=clean_body,
+        review_body_field=review_body_field,
+        review_state=review_state,
+        review_author_type=review_author_type,
+        pr_opened_at=pr_opened_at,
+        head_sha=head_sha,
+        files_changed=files_changed,
+    )
 
+
+def _review_identity_from_clean(
+    *,
+    repo: str,
+    pr_number: int,
+    review_id: int,
+    review_author: str,
+    review_submitted_at: datetime | None,
+    delivery_id: str | None,
+    pr_author_account: str | None,
+    association: str | None,
+    clean_body: str,
+    review_body_field: SanitisedText,
+    review_state: str,
+    review_author_type: str | None,
+    pr_opened_at: datetime | None,
+    head_sha: str | None,
+    files_changed: list[str] | None,
+) -> _ReviewContext:
     state = review_state.strip().lower()
     review_claim = extract_agent_claim(clean_body)
     # The author of the change is whoever opened the PR. A review from that same
@@ -912,20 +1003,10 @@ def _store_review_record(
     re-delivered review read as silence, and silence is what the census path
     records.
     """
-    # Re-sanitised here rather than trusted, so this is the one place a review's
-    # answer text becomes *stored* text and therefore the one place the policy is
-    # applied to it. Idempotent, so a caller that already ran it costs nothing and
-    # a caller that did not cannot get it wrong.
-    answer = sanitise(answer_text)
-    sanitisation_note = combine_notes(answer, *prose_fields)
-    # An empty or oversized body is nothing to capture rather than a record
-    # already held, so it is counted below as neither an attempt nor a
-    # duplicate. Tested against the *sanitised* body, so a review whose entire
-    # content is invisible controls is treated exactly as a review with no body
-    # -- the same outcome the extractors already produce for a body of zero-width
-    # spaces, rather than a second rule that disagrees with it.
-    if not answer.text.strip() or len(answer.text) > MAX_REVIEW_CHARS:
+    prepared = _prepare_review_answer(answer_text, prose_fields)
+    if prepared is None:
         return False, None
+    answer, sanitisation_note = prepared
     entry_id = stable_review_entry_id(event_id)
     claim_token = registry.claim_review_capture(
         review_event_id=event_id,
@@ -938,7 +1019,64 @@ def _store_review_record(
     )
     if claim_token is None:
         return True, None
-    entry = KnowledgeEntry(
+    entry = _build_review_entry(
+        ctx,
+        entry_id=entry_id,
+        event_id=event_id,
+        question_text=question_text,
+        answer=answer,
+        sanitisation_note=sanitisation_note,
+        category=category,
+        tags=tags,
+        extra_metadata=extra_metadata,
+        kind=kind,
+        comment_id=comment_id,
+    )
+    try:
+        return True, _deliver_review_record(registry, sink, event_id, claim_token, entry)
+    except Exception as exc:
+        registry.release_review_capture(event_id, claim_token, type(exc).__name__)
+        raise
+
+
+def _prepare_review_answer(
+    answer_text: str, prose_fields: tuple[SanitisedText | None, ...]
+) -> tuple[SanitisedText, str] | None:
+    """Sanitise one review body, or None when there is nothing to capture.
+
+    Re-sanitised here rather than trusted, so this is the one place a review's
+    answer text becomes *stored* text and therefore the one place the policy is
+    applied to it. Idempotent, so a caller that already ran it costs nothing and
+    a caller that did not cannot get it wrong.
+    """
+    answer = sanitise(answer_text)
+    sanitisation_note = combine_notes(answer, *prose_fields)
+    # An empty or oversized body is nothing to capture rather than a record
+    # already held, so it is counted by the caller as neither an attempt nor a
+    # duplicate. Tested against the *sanitised* body, so a review whose entire
+    # content is invisible controls is treated exactly as a review with no body
+    # -- the same outcome the extractors already produce for a body of zero-width
+    # spaces, rather than a second rule that disagrees with it.
+    if not answer.text.strip() or len(answer.text) > MAX_REVIEW_CHARS:
+        return None
+    return answer, sanitisation_note
+
+
+def _build_review_entry(
+    ctx: _ReviewContext,
+    *,
+    entry_id: str,
+    event_id: str,
+    question_text: str,
+    answer: SanitisedText,
+    sanitisation_note: str,
+    category: QuestionCategory,
+    tags: list[str],
+    extra_metadata: dict[str, object],
+    kind: RecordKind,
+    comment_id: int | None,
+) -> KnowledgeEntry:
+    return KnowledgeEntry(
         entry_id=entry_id,
         session_id=None,
         question_text=question_text,
@@ -1007,17 +1145,22 @@ def _store_review_record(
         captured_at=datetime.now(UTC),
         capture_delivery_id=ctx.delivery_id or event_id,
     )
-    try:
-        outcome = _store_outcome(sink, entry)
-        if outcome.dead_lettered:
-            if not registry.release_review_capture(event_id, claim_token, outcome.detail or "x"):
-                raise RuntimeError("Failed to release dead-lettered review capture claim")
-        elif not registry.complete_review_capture(event_id, claim_token):
-            raise RuntimeError("Failed to complete review capture claim")
-    except Exception as exc:
-        registry.release_review_capture(event_id, claim_token, type(exc).__name__)
-        raise
-    return True, outcome
+
+
+def _deliver_review_record(
+    registry: QuestionRegistry,
+    sink: KnowledgeSink,
+    review_event_id: str,
+    claim_token: str,
+    entry: KnowledgeEntry,
+) -> KnowledgeDeliveryOutcome:
+    outcome = _store_outcome(sink, entry)
+    if outcome.dead_lettered:
+        if not registry.release_review_capture(review_event_id, claim_token, outcome.detail or "x"):
+            raise RuntimeError("Failed to release dead-lettered review capture claim")
+    elif not registry.complete_review_capture(review_event_id, claim_token):
+        raise RuntimeError("Failed to complete review capture claim")
+    return outcome
 
 
 def _store_review_verdict(
@@ -1232,7 +1375,17 @@ def process_review_event_outcome(
     if isinstance(resolved, ReviewCaptureResult):
         return resolved
     ctx = resolved
+    outcomes, claims_attempted = _capture_review_parts(ctx, registry, sink, comments)
+    return _review_capture_result(outcomes, claims_attempted)
 
+
+def _capture_review_parts(
+    ctx: _ReviewContext,
+    registry: QuestionRegistry,
+    sink: KnowledgeSink,
+    comments: list[dict],
+) -> tuple[list[KnowledgeDeliveryOutcome], int]:
+    """Store the verdict and inline comments, counting every claim attempt."""
     outcomes: list[KnowledgeDeliveryOutcome] = []
     # How many records this event tried to write, whatever came of them. Counted at
     # the claim rather than at the store, so a record the claim refused still counts
@@ -1250,7 +1403,7 @@ def process_review_event_outcome(
     inline_attempted, inline_outcomes = _store_inline_comments(ctx, registry, sink, comments)
     claims_attempted += inline_attempted
     outcomes.extend(inline_outcomes)
-    return _review_capture_result(outcomes, claims_attempted)
+    return outcomes, claims_attempted
 
 
 def process_comment_reply(
@@ -1337,14 +1490,8 @@ def process_pr_state_change_outcome(
         return None
     if action not in ["opened", "closed", "reopened"]:
         return None
-
-    # The title is somebody else's prose and becomes this record's question text, so it
-    # goes through the same boundary as every other captured string -- and through the
-    # *wider* pass rather than the marker extractors' narrower one, because there is
-    # no marker here to leave alone and the refused set is a superset, so nothing the
-    # narrower pass would have removed survives this one. Sanitising after the action
-    # gate rather than before it keeps the guard on what the forge said.
-    #
+    # The title is somebody else's prose and becomes this record's question text,
+    # so it goes through the same sanitise boundary as every other captured string.
     # The removals are recorded, because a lifecycle record whose title was rewritten
     # is otherwise a record whose title somebody else wrote.
     title_field = sanitise(pr_title)
@@ -1358,7 +1505,46 @@ def process_pr_state_change_outcome(
     claim_token = registry.claim_pr_state_change(repo, pr_number, action, event_id)
     if claim_token is None:
         return None
+    entry = _build_pr_state_entry(
+        repo=repo,
+        pr_number=pr_number,
+        pr_title=pr_title,
+        title_note=title_note,
+        action=action,
+        pr_state=pr_state,
+        pr_closed_at=pr_closed_at,
+        pr_opened_at=pr_opened_at,
+        pr_merged_at=pr_merged_at,
+        pr_author_account=pr_author_account,
+        head_sha=head_sha,
+        files_changed=files_changed,
+        delivery_id=delivery_id,
+        event_id=event_id,
+    )
+    try:
+        return _deliver_pr_state_entry(registry, sink, event_id, claim_token, entry)
+    except Exception as exc:
+        registry.release_pr_state_change(event_id, claim_token, type(exc).__name__)
+        raise
 
+
+def _build_pr_state_entry(
+    *,
+    repo: str,
+    pr_number: int,
+    pr_title: str,
+    title_note: str,
+    action: str,
+    pr_state: str,
+    pr_closed_at: datetime | None,
+    pr_opened_at: datetime | None,
+    pr_merged_at: datetime | None,
+    pr_author_account: str | None,
+    head_sha: str | None,
+    files_changed: list[str] | None,
+    delivery_id: str | None,
+    event_id: str,
+) -> KnowledgeEntry:
     # A reopen is neither an open nor a close, so the open time is not a fallback
     # for it: GitHub reports no reopen timestamp, and the one below is a
     # declaration that nothing better is known rather than a claim that the change
@@ -1367,7 +1553,7 @@ def process_pr_state_change_outcome(
     close_outcome = _close_outcome(
         action=action, pr_state=pr_state, pr_merged_at=pr_merged_at, pr_closed_at=pr_closed_at
     )
-    entry = KnowledgeEntry(
+    return KnowledgeEntry(
         entry_id=f"pr-event-{event_id}",
         session_id=None,
         question_text=f"PR {action}: {pr_title}",
@@ -1406,19 +1592,23 @@ def process_pr_state_change_outcome(
         capture_delivery_id=delivery_id or event_id,
     )
 
-    try:
-        outcome = _store_outcome(sink, entry)
-        if outcome.dead_lettered:
-            if not registry.release_pr_state_change(
-                event_id, claim_token, outcome.detail or "delivery dead-lettered"
-            ):
-                raise RuntimeError("Failed to release dead-lettered PR capture claim")
-            return outcome
-        if not registry.complete_pr_state_change(event_id, claim_token):
-            raise RuntimeError("Failed to complete PR capture claim")
-    except Exception as exc:
-        registry.release_pr_state_change(event_id, claim_token, type(exc).__name__)
-        raise
+
+def _deliver_pr_state_entry(
+    registry: QuestionRegistry,
+    sink: KnowledgeSink,
+    event_id: str,
+    claim_token: str,
+    entry: KnowledgeEntry,
+) -> KnowledgeDeliveryOutcome:
+    outcome = _store_outcome(sink, entry)
+    if outcome.dead_lettered:
+        if not registry.release_pr_state_change(
+            event_id, claim_token, outcome.detail or "delivery dead-lettered"
+        ):
+            raise RuntimeError("Failed to release dead-lettered PR capture claim")
+        return outcome
+    if not registry.complete_pr_state_change(event_id, claim_token):
+        raise RuntimeError("Failed to complete PR capture claim")
     return outcome
 
 
@@ -1463,6 +1653,42 @@ def _answer_context(
     already answered are all comments this function was not asked to store,
     and the caller reports them identically.
     """
+    admitted = _admit_answer_comment(
+        new_comment_body=new_comment_body,
+        new_comment_author_association=new_comment_author_association,
+        question_id=question_id,
+    )
+    if admitted is None:
+        return None
+    requested_question_id, author_association, answer, sanitisation_note = admitted
+    seen = _answer_dedupe(
+        registry,
+        new_comment_id=new_comment_id,
+        parent_comment_id=parent_comment_id,
+        requested_question_id=requested_question_id,
+    )
+    if seen is None:
+        return None
+    question, registered_question_id = seen
+    return _answer_identity(
+        new_comment_body=new_comment_body,
+        new_comment_author=new_comment_author,
+        author_association=author_association,
+        question=question,
+        registered_question_id=registered_question_id,
+        parent_agent_claim=parent_agent_claim,
+        answer=answer,
+        sanitisation_note=sanitisation_note,
+    )
+
+
+def _admit_answer_comment(
+    *,
+    new_comment_body: str,
+    new_comment_author_association: str | None,
+    question_id: str | None,
+) -> tuple[str | None, str | None, SanitisedText, str] | None:
+    """The comment-shape gates: association, marker, extraction and size."""
     author_association = (
         new_comment_author_association.strip().upper() if new_comment_author_association else None
     )
@@ -1470,7 +1696,6 @@ def _answer_context(
         return None
     if not new_comment_body.strip():
         return None
-
     marker_question_id = extract_answer_question_id_from_comment_body(new_comment_body)
     requested_question_id = question_id or marker_question_id
     if marker_question_id and requested_question_id and marker_question_id != requested_question_id:
@@ -1495,12 +1720,21 @@ def _answer_context(
     # producing a record that counts as knowledge and reads as nothing.
     if len(new_comment_body) > MAX_ANSWER_CHARS or not answer.text.strip():
         return None
+    return requested_question_id, author_association, answer, sanitisation_note
 
+
+def _answer_dedupe(
+    registry: QuestionRegistry,
+    *,
+    new_comment_id: int,
+    parent_comment_id: int,
+    requested_question_id: str | None,
+) -> tuple[dict[str, Any], str] | None:
+    """The registry gates: duplicate delivery, answered question, id match."""
     if registry.answer_comment_seen(new_comment_id):
         return None
     if registry.is_question_answered(parent_comment_id):
         return None
-
     question = registry.get_question_by_comment_id(parent_comment_id)
     if not question:
         return None
@@ -1509,6 +1743,20 @@ def _answer_context(
         return None
     if not registered_question_id:
         return None
+    return question, registered_question_id
+
+
+def _answer_identity(
+    *,
+    new_comment_body: str,
+    new_comment_author: str | None,
+    author_association: str | None,
+    question: dict[str, Any],
+    registered_question_id: str,
+    parent_agent_claim: AgentClaim | None,
+    answer: SanitisedText,
+    sanitisation_note: str,
+) -> _AnswerContext | None:
     agent_claim = extract_agent_claim(new_comment_body)
     agent_id = agent_claim.agent_id if agent_claim is not None else None
     answered_by_model = agent_claim.model if agent_claim is not None else None
@@ -1528,7 +1776,6 @@ def _answer_context(
     )
     if same_account_as_asker and not agent_id:
         return None
-
     # Independence is computed here, from the two comments as they exist on the
     # forge, rather than from anything cached at question time. The asker's claim is
     # read off the parent comment body by the caller, so a later edit to either
@@ -1723,13 +1970,7 @@ def process_comment_reply_outcome(
     )
     if claim_token is None:
         return None
-
-    category_str = ctx.question.get("category") or "design_decision"
-    try:
-        category = QuestionCategory(category_str)
-    except ValueError:
-        category = QuestionCategory.DESIGN_DECISION
-
+    category = _answer_category(ctx.question)
     entry = _build_answer_entry(
         ctx,
         repo=repo,
@@ -1742,18 +1983,35 @@ def process_comment_reply_outcome(
         category=category,
         delivery_id=delivery_id,
     )
-
     try:
-        outcome = _store_outcome(sink, entry)
-        if outcome.dead_lettered:
-            if not registry.release_answer(new_comment_id, claim_token):
-                raise RuntimeError("Failed to release dead-lettered answer capture claim")
-            return outcome
-        if not registry.complete_answer(new_comment_id, claim_token):
-            raise RuntimeError("Failed to complete answer capture claim")
+        return _deliver_answer(registry, sink, new_comment_id, claim_token, entry)
     except Exception:
         registry.release_answer(new_comment_id, claim_token)
         raise
+
+
+def _answer_category(question: dict[str, Any]) -> QuestionCategory:
+    category_str = question.get("category") or "design_decision"
+    try:
+        return QuestionCategory(category_str)
+    except ValueError:
+        return QuestionCategory.DESIGN_DECISION
+
+
+def _deliver_answer(
+    registry: QuestionRegistry,
+    sink: KnowledgeSink,
+    new_comment_id: int,
+    claim_token: str,
+    entry: KnowledgeEntry,
+) -> KnowledgeDeliveryOutcome:
+    outcome = _store_outcome(sink, entry)
+    if outcome.dead_lettered:
+        if not registry.release_answer(new_comment_id, claim_token):
+            raise RuntimeError("Failed to release dead-lettered answer capture claim")
+        return outcome
+    if not registry.complete_answer(new_comment_id, claim_token):
+        raise RuntimeError("Failed to complete answer capture claim")
     return outcome
 
 
@@ -1793,10 +2051,49 @@ def process_check_run_outcome(
     conclusion = (check_conclusion or "").strip().lower()
     if not conclusion:
         return None
-
     # The forge's own id is the identity: a re-run is a new check run with a new
     # id, so this does not collapse a re-run into the run it replaced.
     event_id = f"check-run:{repo.casefold()}:{check_run_id}"
+    claimed = _claim_check_run(
+        registry,
+        event_id=event_id,
+        repo=repo,
+        pr_number=pr_number,
+        check_run_id=check_run_id,
+        check_name=check_name,
+    )
+    if claimed is None:
+        return None
+    check_name, check_name_note, claim_token = claimed
+    entry = _build_check_entry(
+        event_id=event_id,
+        repo=repo,
+        pr_number=pr_number,
+        check_run_id=check_run_id,
+        check_name=check_name,
+        check_name_note=check_name_note,
+        check_status=check_status,
+        conclusion=conclusion,
+        head_sha=head_sha,
+        delivery_id=delivery_id,
+    )
+    try:
+        return _deliver_check(registry, sink, event_id, claim_token, entry)
+    except Exception as exc:
+        registry.release_review_capture(event_id, claim_token, type(exc).__name__)
+        raise
+
+
+def _claim_check_run(
+    registry: QuestionRegistry,
+    *,
+    event_id: str,
+    repo: str,
+    pr_number: int | None,
+    check_run_id: int,
+    check_name: str,
+) -> tuple[str, str, str] | None:
+    """Sanitise the check name and claim the run. None when already captured."""
     # Sanitised here rather than at the model because this is the only writer in the
     # capture path that takes a bare string for a name it stores: the check name
     # becomes the record's author, its title and the first line of its body, so it is
@@ -1821,8 +2118,23 @@ def process_check_run_outcome(
     )
     if claim_token is None:
         return None
+    return check_name, check_name_note, claim_token
 
-    entry = KnowledgeEntry(
+
+def _build_check_entry(
+    *,
+    event_id: str,
+    repo: str,
+    pr_number: int | None,
+    check_run_id: int,
+    check_name: str,
+    check_name_note: str,
+    check_status: str,
+    conclusion: str,
+    head_sha: str | None,
+    delivery_id: str | None,
+) -> KnowledgeEntry:
+    return KnowledgeEntry(
         entry_id=stable_check_entry_id(event_id),
         session_id=None,
         question_text=f"Check {check_name} concluded {conclusion}",
@@ -1860,16 +2172,21 @@ def process_check_run_outcome(
         captured_at=datetime.now(UTC),
         capture_delivery_id=delivery_id or event_id,
     )
-    try:
-        outcome = _store_outcome(sink, entry)
-        if outcome.dead_lettered:
-            if not registry.release_review_capture(
-                event_id, claim_token, outcome.detail or "check capture dead-lettered"
-            ):
-                raise RuntimeError("Failed to release dead-lettered check capture claim")
-        elif not registry.complete_review_capture(event_id, claim_token):
-            raise RuntimeError("Failed to complete check capture claim")
-    except Exception as exc:
-        registry.release_review_capture(event_id, claim_token, type(exc).__name__)
-        raise
+
+
+def _deliver_check(
+    registry: QuestionRegistry,
+    sink: KnowledgeSink,
+    event_id: str,
+    claim_token: str,
+    entry: KnowledgeEntry,
+) -> KnowledgeDeliveryOutcome:
+    outcome = _store_outcome(sink, entry)
+    if outcome.dead_lettered:
+        if not registry.release_review_capture(
+            event_id, claim_token, outcome.detail or "check capture dead-lettered"
+        ):
+            raise RuntimeError("Failed to release dead-lettered check capture claim")
+    elif not registry.complete_review_capture(event_id, claim_token):
+        raise RuntimeError("Failed to complete check capture claim")
     return outcome

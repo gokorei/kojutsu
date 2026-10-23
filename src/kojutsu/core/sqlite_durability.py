@@ -20,9 +20,12 @@ proves nothing about the pragma. Assert the pragma directly.
 
 from __future__ import annotations
 
+import os
 import sqlite3
+import stat
+from pathlib import Path
 
-__all__ = ["DurabilityError", "configure_durable_connection"]
+__all__ = ["DurabilityError", "configure_durable_connection", "secure_database_file"]
 
 _EXPECTED_JOURNAL_MODE = "wal"
 _EXPECTED_SYNCHRONOUS = 2  # FULL, as SQLite reports it.
@@ -72,3 +75,27 @@ def configure_durable_connection(db: sqlite3.Connection) -> None:
         raise DurabilityError(
             f"Could not enable foreign-key enforcement; SQLite reported {foreign_keys!r}."
         )
+
+
+def secure_database_file(path: str | Path, error_type: type[Exception] = OSError) -> None:
+    """Create-or-open a SQLite file with 0600 perms, refusing symlinks and foreign owners.
+
+    Single definition for the outbox and the question registry, which previously
+    carried identical 13-line copies. ``error_type`` preserves each caller's
+    exception contract (outbox raises ``OutboxOwnershipError``, registry raises
+    ``PermissionError``).
+    """
+    resolved = Path(path).expanduser()
+    flags = os.O_CREAT | os.O_RDWR
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(resolved, flags, 0o600)
+    try:
+        file_stat = os.fstat(descriptor)
+        if not stat.S_ISREG(file_stat.st_mode):
+            raise error_type(f"{resolved} must be a regular file")
+        if hasattr(os, "geteuid") and file_stat.st_uid != os.geteuid():
+            raise error_type(f"{resolved} must be owned by the current user")
+        os.fchmod(descriptor, 0o600)
+    finally:
+        os.close(descriptor)

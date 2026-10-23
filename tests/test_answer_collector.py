@@ -6,6 +6,7 @@ from pathlib import Path
 from threading import Barrier
 
 import pytest
+from tests.support import table_count
 
 from kojutsu.core import text_hygiene
 from kojutsu.core.answer_collector import (
@@ -291,7 +292,7 @@ def test_dead_lettered_answer_releases_capture_for_retry(registry) -> None:
 
     assert outcome is not None and outcome.dead_lettered
     assert not registry.is_question_answered(100)
-    assert registry._db.execute("SELECT COUNT(*) FROM answer_captures").fetchone()[0] == 0
+    assert table_count(registry.path, "answer_captures") == 0
 
 
 def test_dead_lettered_pr_event_is_not_registry_completed(registry) -> None:

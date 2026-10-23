@@ -8,16 +8,16 @@ import json
 import os
 import random
 import sqlite3
-import stat
 import threading
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import TracebackType
 from typing import Any, ClassVar
 
-from kojutsu.core.sqlite_durability import configure_durable_connection
+from kojutsu.core.sqlite_durability import configure_durable_connection, secure_database_file
 from kojutsu.integrations.tanseki import TansekiError, TansekiPermanentError, TansekiWriter
 
 DEFAULT_RETENTION_DAYS = 30
@@ -225,6 +225,100 @@ def _positive_limit(name: str, value: int) -> int:
     return value
 
 
+class _OutboxQuota:
+    """Owns the outbox bound: limits, occupancy, and admission.
+
+    The bound is applied by declining, never by making room. Occupancy is
+    counted by scanning rather than from a cached counter, because a counter
+    drifts the moment anything else moves the total: ``mark_sent`` deletes
+    rows, cleanup deletes rows, and a process killed between the write and
+    the counter's increment leaves the two permanently disagreeing. A
+    drifted counter refuses at a limit that is not the real occupancy, and
+    an operator cannot act on a number they cannot reproduce. A capture is
+    one scan per human decision, which is not a hot path.
+    """
+
+    def __init__(
+        self,
+        db: sqlite3.Connection,
+        lock: threading.RLock,
+        *,
+        max_entries: int,
+        max_bytes: int,
+    ) -> None:
+        self._db = db
+        self._lock = lock
+        self._max_entries = max_entries
+        self._max_bytes = max_bytes
+
+    @property
+    def max_entries(self) -> int:
+        return self._max_entries
+
+    @property
+    def max_bytes(self) -> int:
+        return self._max_bytes
+
+    def usage(self) -> OutboxQuotaUsage:
+        """Report what the quota holds now, for an operator surface or health check."""
+        with self._lock:
+            return self.usage_locked()
+
+    def usage_locked(self) -> OutboxQuotaUsage:
+        """Occupancy as the caller sees it; the caller must hold the lock.
+
+        Inside ``enqueue`` this runs in the open write transaction, so the
+        totals include this transaction's own uncommitted work -- which is
+        what makes the quota a bound rather than a check that two callers
+        can both pass.
+        """
+        row = self._db.execute(
+            f"SELECT COUNT(*), COALESCE(SUM({_ROW_BYTES}), 0) FROM outbox"
+        ).fetchone()
+        return OutboxQuotaUsage(
+            entries=int(row[0]),
+            bytes=int(row[1]),
+            max_entries=self._max_entries,
+            max_bytes=self._max_bytes,
+        )
+
+    def admit(
+        self,
+        entry_id: str,
+        usage: OutboxQuotaUsage,
+        *,
+        projected_bytes: int,
+        adds_entry: bool,
+    ) -> None:
+        """Refuse an enqueue that would take the outbox past its bound.
+
+        ``projected_bytes`` is what the outbox would hold *after* this enqueue,
+        and ``adds_entry`` says whether it would be a row the outbox does not
+        already hold. Both matter for duplicates: an entry that is already
+        stored is charged only the difference its new content makes, because a
+        retry storm must not be able to exhaust the quota by repeating one fact,
+        and a producer re-confirming something already durable must not be told
+        "not stored" when it is in fact stored -- that ambiguity is what makes a
+        webhook retry and post the comment twice.
+        """
+        if adds_entry and usage.entries >= usage.max_entries:
+            raise OutboxQuotaError(
+                entry_id,
+                limit_name="max_entries",
+                limit=usage.max_entries,
+                observed=usage.entries,
+                usage=usage,
+            )
+        if projected_bytes > usage.max_bytes:
+            raise OutboxQuotaError(
+                entry_id,
+                limit_name="max_bytes",
+                limit=usage.max_bytes,
+                observed=projected_bytes,
+                usage=usage,
+            )
+
+
 def _secure_open_flags() -> int:
     flags = os.O_CREAT | os.O_RDWR
     if hasattr(os, "O_NOFOLLOW"):
@@ -402,8 +496,6 @@ class TansekiOutbox:
         """
         if retention_days is not None and retention_days < 0:
             raise ValueError("retention_days must be non-negative")
-        self.max_entries = _positive_limit("max_entries", max_entries)
-        self.max_bytes = _positive_limit("max_bytes", max_bytes)
         self.path = Path(path).expanduser()
         parent_created = not self.path.parent.exists()
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -419,6 +511,12 @@ class TansekiOutbox:
             self._db = sqlite3.connect(str(self.path), check_same_thread=False, timeout=5.0)
             configure_durable_connection(self._db)
             _migrate_schema(self._db)
+            self._quota = _OutboxQuota(
+                self._db,
+                self._lock,
+                max_entries=_positive_limit("max_entries", max_entries),
+                max_bytes=_positive_limit("max_bytes", max_bytes),
+            )
             self.cleanup_dead_letters()
         except BaseException:
             try:
@@ -428,17 +526,18 @@ class TansekiOutbox:
                 _OwnerRegistry.release(self.owner_lock_path, self._owner)
             raise
 
+    @property
+    def max_entries(self) -> int:
+        """Most rows the outbox will hold; the quota owns the value."""
+        return self._quota.max_entries
+
+    @property
+    def max_bytes(self) -> int:
+        """Most bytes of queued content the outbox will hold."""
+        return self._quota.max_bytes
+
     def _secure_database_file(self) -> None:
-        descriptor = os.open(self.path, _secure_open_flags(), 0o600)
-        try:
-            file_stat = os.fstat(descriptor)
-            if not stat.S_ISREG(file_stat.st_mode):
-                raise OutboxOwnershipError("Outbox path must be a regular file")
-            if hasattr(os, "geteuid") and file_stat.st_uid != os.geteuid():
-                raise OutboxOwnershipError("Outbox file must be owned by the current user")
-            os.fchmod(descriptor, 0o600)
-        finally:
-            os.close(descriptor)
+        secure_database_file(self.path, OutboxOwnershipError)
 
     def close(self) -> None:
         with self._lock:
@@ -453,78 +552,99 @@ class TansekiOutbox:
     def __enter__(self) -> TansekiOutbox:
         return self
 
-    def __exit__(self, *exc: object) -> None:
-        self.close()
-
-    def _occupied(self) -> tuple[int, int]:
-        """Return rows held and bytes of queued content, as the caller sees them.
-
-        The caller must already hold ``self._lock``. Inside ``enqueue`` this runs
-        in the open write transaction, so the totals it returns include this
-        transaction's own uncommitted work -- which is what makes the quota a
-        bound rather than a check that two callers can both pass.
-
-        Counted by scanning rather than from a cached counter, because a counter
-        drifts the moment anything else moves the total: ``mark_sent`` deletes
-        rows, cleanup deletes rows, and a process killed between the write and
-        the counter's increment leaves the two permanently disagreeing. A
-        drifted counter refuses at a limit that is not the real occupancy, and
-        an operator cannot act on a number they cannot reproduce. A capture is
-        one scan per human decision, which is not a hot path.
-        """
-        row = self._db.execute(
-            f"SELECT COUNT(*), COALESCE(SUM({_ROW_BYTES}), 0) FROM outbox"
-        ).fetchone()
-        return int(row[0]), int(row[1])
-
-    def _admit(
+    def __exit__(
         self,
-        entry_id: str,
-        usage: OutboxQuotaUsage,
-        *,
-        projected_bytes: int,
-        adds_entry: bool,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
     ) -> None:
-        """Refuse an enqueue that would take the outbox past its bound.
-
-        ``projected_bytes`` is what the outbox would hold *after* this enqueue,
-        and ``adds_entry`` says whether it would be a row the outbox does not
-        already hold. Both matter for duplicates: an entry that is already
-        stored is charged only the difference its new content makes, because a
-        retry storm must not be able to exhaust the quota by repeating one fact,
-        and a producer re-confirming something already durable must not be told
-        "not stored" when it is in fact stored -- that ambiguity is what makes a
-        webhook retry and post the comment twice.
-
-        Nothing is deleted here. The bound is applied by declining, never by
-        making room.
-        """
-        if adds_entry and usage.entries >= usage.max_entries:
-            raise OutboxQuotaError(
-                entry_id,
-                limit_name="max_entries",
-                limit=usage.max_entries,
-                observed=usage.entries,
-                usage=usage,
-            )
-        if projected_bytes > usage.max_bytes:
-            raise OutboxQuotaError(
-                entry_id,
-                limit_name="max_bytes",
-                limit=usage.max_bytes,
-                observed=projected_bytes,
-                usage=usage,
-            )
+        self.close()
 
     def quota_usage(self) -> OutboxQuotaUsage:
         """Report what the quota holds now, for an operator surface or a health check."""
-        with self._lock:
-            entries, queued_bytes = self._occupied()
-        return OutboxQuotaUsage(
-            entries=entries,
-            bytes=queued_bytes,
-            max_entries=self.max_entries,
-            max_bytes=self.max_bytes,
+        return self._quota.usage()
+
+    def _quota_usage_locked(self) -> OutboxQuotaUsage:
+        return self._quota.usage_locked()
+
+    def _enqueue_over_lease(
+        self, entry_id: str, payload: dict[str, Any], row: tuple[Any, ...], now: str
+    ) -> None:
+        """Stage a replacement behind an active delivery lease.
+
+        The lease keeps delivering the row's current payload, so the staged
+        replacement is the only content that changes and no row is added --
+        this can only be refused by the byte bound. Re-sending exactly what is
+        already in flight stages nothing: that duplicate is a second copy of a
+        payload the outbox already holds, and refusing a producer's
+        re-confirmation of something durable is how a webhook ends up retrying
+        and posting the same comment twice.
+        """
+        usage = self._quota_usage_locked()
+        occupied_bytes = usage.bytes
+        payload_text = json.dumps(payload)
+        payload_bytes = _text_bytes(payload_text)
+        redundant = str(row[2]) == payload_text
+        self._quota.admit(
+            entry_id,
+            usage,
+            projected_bytes=occupied_bytes - int(row[3]) + (0 if redundant else payload_bytes),
+            adds_entry=False,
+        )
+        if redundant:
+            self._db.execute(
+                "UPDATE outbox SET updated_at = ? WHERE entry_id = ?",
+                (now, entry_id),
+            )
+        else:
+            self._db.execute(
+                """
+                UPDATE outbox SET pending_payload = ?, updated_at = ?
+                WHERE entry_id = ?
+                """,
+                (payload_text, now, entry_id),
+            )
+
+    def _enqueue_fresh(
+        self, entry_id: str, payload: dict[str, Any], row: tuple[Any, ...] | None, now: str
+    ) -> None:
+        """Upsert an unleased entry, charging only what actually changes on disk.
+
+        Replacing a row subtracts what that row costs today, so re-sending an
+        entry that is already stored is charged only for the difference. The
+        upsert clears pending_payload and last_error, so entry_id and payload
+        are the whole of the new cost.
+        """
+        usage = self._quota_usage_locked()
+        occupied_bytes = usage.bytes
+        payload_text = json.dumps(payload)
+        payload_bytes = _text_bytes(payload_text)
+        self._quota.admit(
+            entry_id,
+            usage,
+            projected_bytes=(
+                occupied_bytes
+                - (int(row[4]) if row is not None else 0)
+                + _text_bytes(entry_id)
+                + payload_bytes
+            ),
+            adds_entry=row is None,
+        )
+        self._db.execute(
+            """
+            INSERT INTO outbox (
+                entry_id, payload, pending_payload, status, attempts, last_error,
+                next_attempt_at, dead_lettered_at, lease_token, lease_expires_at,
+                created_at, updated_at
+            ) VALUES (?, ?, NULL, 'pending', 0, NULL, NULL, NULL, NULL, NULL, ?, ?)
+            ON CONFLICT(entry_id) DO UPDATE SET
+                payload = excluded.payload, pending_payload = NULL,
+                status = 'pending', attempts = 0, last_error = NULL,
+                next_attempt_at = NULL, dead_lettered_at = NULL,
+                lease_token = NULL, lease_expires_at = NULL,
+                updated_at = excluded.updated_at
+            """,
+            (entry_id, payload_text, now, now),
         )
 
     def enqueue(self, entry_id: str, payload: dict[str, Any]) -> bool:
@@ -561,79 +681,10 @@ class TansekiOutbox:
                 active = (
                     row is not None and row[0] is not None and (row[1] is None or str(row[1]) > now)
                 )
-                occupied_entries, occupied_bytes = self._occupied()
-                usage = OutboxQuotaUsage(
-                    entries=occupied_entries,
-                    bytes=occupied_bytes,
-                    max_entries=self.max_entries,
-                    max_bytes=self.max_bytes,
-                )
-                payload_text = json.dumps(payload)
-                payload_bytes = _text_bytes(payload_text)
                 if active:
-                    # The lease keeps delivering the row's current payload, so the
-                    # staged replacement is the only content that changes and no
-                    # row is added -- this can only be refused by the byte bound.
-                    # Re-sending exactly what is already in flight stages nothing:
-                    # that duplicate is a second copy of a payload the outbox
-                    # already holds, and refusing a producer's re-confirmation of
-                    # something durable is how a webhook ends up retrying and
-                    # posting the same comment twice.
-                    redundant = str(row[2]) == payload_text
-                    self._admit(
-                        entry_id,
-                        usage,
-                        projected_bytes=(
-                            occupied_bytes - int(row[3]) + (0 if redundant else payload_bytes)
-                        ),
-                        adds_entry=False,
-                    )
-                    if redundant:
-                        self._db.execute(
-                            "UPDATE outbox SET updated_at = ? WHERE entry_id = ?",
-                            (now, entry_id),
-                        )
-                    else:
-                        self._db.execute(
-                            """
-                            UPDATE outbox SET pending_payload = ?, updated_at = ?
-                            WHERE entry_id = ?
-                            """,
-                            (payload_text, now, entry_id),
-                        )
+                    self._enqueue_over_lease(entry_id, payload, row, now)
                 else:
-                    # Replacing a row subtracts what that row costs today, so
-                    # re-sending an entry that is already stored is charged only
-                    # for what actually changes on disk. The upsert clears
-                    # pending_payload and last_error, so entry_id and payload are
-                    # the whole of the new cost.
-                    self._admit(
-                        entry_id,
-                        usage,
-                        projected_bytes=(
-                            occupied_bytes
-                            - (int(row[4]) if row is not None else 0)
-                            + _text_bytes(entry_id)
-                            + payload_bytes
-                        ),
-                        adds_entry=row is None,
-                    )
-                    self._db.execute(
-                        """
-                        INSERT INTO outbox (
-                            entry_id, payload, pending_payload, status, attempts, last_error,
-                            next_attempt_at, dead_lettered_at, lease_token, lease_expires_at,
-                            created_at, updated_at
-                        ) VALUES (?, ?, NULL, 'pending', 0, NULL, NULL, NULL, NULL, NULL, ?, ?)
-                        ON CONFLICT(entry_id) DO UPDATE SET
-                            payload = excluded.payload, pending_payload = NULL,
-                            status = 'pending', attempts = 0, last_error = NULL,
-                            next_attempt_at = NULL, dead_lettered_at = NULL,
-                            lease_token = NULL, lease_expires_at = NULL,
-                            updated_at = excluded.updated_at
-                        """,
-                        (entry_id, payload_text, now, now),
-                    )
+                    self._enqueue_fresh(entry_id, payload, row, now)
                 self._db.commit()
             except BaseException:
                 self._db.rollback()

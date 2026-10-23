@@ -101,7 +101,7 @@ rather than to a writer.
 from __future__ import annotations
 
 import threading
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -110,6 +110,7 @@ from typing import Any
 from kojutsu import allowlist
 from kojutsu.config import Settings
 from kojutsu.core.answer_collector import (
+    ReviewCaptureResult,
     capture_counts,
     process_comment_reply_outcome,
     process_review_event_outcome,
@@ -255,7 +256,21 @@ def build_plan(
             "Name at least one repository with --repo. A backfill with no repository would "
             "read every repository the token can reach."
         )
+    selected = _select_backfill_repositories(settings, requested)
+    max_objects = _check_max_objects(max_objects)
+    floor, ceiling = _parse_backfill_range(since, until)
+    parsed_prs = _parse_backfill_prs(pr_numbers)
+    return BackfillPlan(
+        repositories=tuple(selected),
+        since=floor,
+        max_objects=max_objects,
+        until=ceiling,
+        authorized_associations=authorized_associations,
+        pr_numbers=parsed_prs,
+    )
 
+
+def _select_backfill_repositories(settings: Settings, requested: list[str]) -> list[str]:
     selected: list[str] = []
     seen: set[str] = set()
     for repository in requested:
@@ -275,7 +290,10 @@ def build_plan(
             continue
         seen.add(folded)
         selected.append(repository)
+    return selected
 
+
+def _check_max_objects(max_objects: int) -> int:
     if not isinstance(max_objects, int) or isinstance(max_objects, bool) or max_objects < 1:
         raise ValueError("--max-objects must be at least 1; a run that reads nothing is not a run.")
     if max_objects > MAX_OBJECTS_PER_RUN:
@@ -283,7 +301,10 @@ def build_plan(
             f"--max-objects is capped at {MAX_OBJECTS_PER_RUN}; the cap exists because the "
             "token and the rate limit are shared with every other user of the forge."
         )
+    return max_objects
 
+
+def _parse_backfill_range(since: str, until: str | None) -> tuple[datetime, datetime | None]:
     floor = _parse_bound(since, "since")
     if floor.date() > datetime.now(UTC).date():
         raise ValueError(
@@ -291,7 +312,6 @@ def build_plan(
             "reconstructs nothing, and a run that reports success while reading nothing is the "
             "failure this command exists to avoid."
         )
-
     ceiling: datetime | None = None
     ceiling_text = str(until or "").strip()
     if ceiling_text:
@@ -307,33 +327,27 @@ def build_plan(
         # 2026-09-30`` is the whole of the 30th, the same inclusive reading the
         # sibling ``backfill`` gives the same spelling.
         ceiling = parsed.replace(hour=23, minute=59, second=59, microsecond=999_999)
+    return floor, ceiling
 
-    parsed_prs: tuple[int, ...] | None = None
-    if pr_numbers is not None:
-        seen_prs: set[int] = set()
-        ordered: list[int] = []
-        for raw in pr_numbers:
-            try:
-                number = int(str(raw).strip())
-            except (TypeError, ValueError):
-                raise ValueError(f"--pr must name pull request numbers, got {raw!r}.") from None
-            if isinstance(raw, bool) or number < 1:
-                raise ValueError(f"--pr must name pull request numbers, got {raw!r}.")
-            if number not in seen_prs:
-                seen_prs.add(number)
-                ordered.append(number)
-        if not ordered:
-            raise ValueError("--pr names no pull request; omit it to walk the listing.")
-        parsed_prs = tuple(ordered)
 
-    return BackfillPlan(
-        repositories=tuple(selected),
-        since=floor,
-        max_objects=max_objects,
-        until=ceiling,
-        authorized_associations=authorized_associations,
-        pr_numbers=parsed_prs,
-    )
+def _parse_backfill_prs(pr_numbers: Sequence[int | str] | None) -> tuple[int, ...] | None:
+    if pr_numbers is None:
+        return None
+    seen_prs: set[int] = set()
+    ordered: list[int] = []
+    for raw in pr_numbers:
+        try:
+            number = int(str(raw).strip())
+        except (TypeError, ValueError):
+            raise ValueError(f"--pr must name pull request numbers, got {raw!r}.") from None
+        if isinstance(raw, bool) or number < 1:
+            raise ValueError(f"--pr must name pull request numbers, got {raw!r}.")
+        if number not in seen_prs:
+            seen_prs.add(number)
+            ordered.append(number)
+    if not ordered:
+        raise ValueError("--pr names no pull request; omit it to walk the listing.")
+    return tuple(ordered)
 
 
 def _parse_bound(text: str, field_name: str) -> datetime:
@@ -553,7 +567,13 @@ class _Budget:
 
 
 class _Tally:
-    """Mutable counters for the duration of one run."""
+    """Mutable counters for the duration of one run.
+
+    Every transition is a method, so call sites state the intention ("a
+    finished object was skipped") rather than reaching into the counters.
+    The fields stay readable -- reports and tests read them -- but only
+    these methods write them.
+    """
 
     def __init__(self) -> None:
         self.objects_read = 0
@@ -570,6 +590,48 @@ class _Tally:
         self.gaps.append(
             BackfillGap(repository=repository, pr_number=pr_number, what=what, reason=reason)
         )
+
+    def note_read(self) -> None:
+        """One object handed out for reconstruction."""
+        self.objects_read += 1
+
+    def note_skipped_finished(self) -> None:
+        """One object skipped under a finished-pass receipt."""
+        self.skipped_finished += 1
+
+    def note_floor_unreached(self) -> None:
+        """The enumeration ended above the floor; name it as such."""
+        self.floor_unreached = True
+
+    def note_stored(self, written: int, already: bool) -> None:
+        """Fold one object's capture counts into the run totals."""
+        self.records_written += written
+        if written:
+            self.objects_new += 1
+        if already:
+            self.already_present += 1
+
+    def note_already_present(self) -> None:
+        """One object whose record was already stored: a duplicate, not work."""
+        self.already_present += 1
+
+    def note_silent(self, refusal: str | None) -> None:
+        """One object read that stored nothing and was no duplicate.
+
+        Which gate, because the reason decides what the number means. A
+        review with nothing capturable is an absence of review; one refused
+        by ``author_association`` is review activity the corpus is throwing
+        away, and those two are indistinguishable unless told apart. The
+        association gate only fires for a run that narrowed the policy
+        deliberately, so a run reporting it reports its own configuration.
+        ``None`` records no refusal: some paths (a comment without a parent)
+        have no gate to name.
+        """
+        self.silent += 1
+        if refusal is None:
+            return
+        reason = refusal or "unknown"
+        self.refusals[reason] = self.refusals.get(reason, 0) + 1
 
 
 def _normalise(timestamp: datetime) -> datetime:
@@ -881,9 +943,9 @@ def _single_pull_requests(
             # pull request can store, and the listing timestamp proves nothing
             # moved since. The listing read that proved it is the cheap part;
             # the review and comment reads it avoids are not.
-            tally.skipped_finished += 1
+            tally.note_skipped_finished()
             continue
-        tally.objects_read += 1
+        tally.note_read()
         yield pull
 
 
@@ -970,39 +1032,62 @@ def _pull_requests(
                 raise outcome
             batch = list(outcome)
             if not batch:
-                tally.floor_unreached = True
+                tally.note_floor_unreached()
                 return
-            for pull in batch:
-                updated_at = getattr(pull, "updated_at", None)
-                if updated_at is not None:
-                    if _before_floor(updated_at, plan):
-                        # Every later entry is older than this one, so the rest of the
-                        # walk proves itself unnecessary.
-                        return
-                    if _above_ceiling(updated_at, plan):
-                        # Too recent for the era named. This page is over, the next one
-                        # is older, and the window may be on it — so this entry is
-                        # skipped rather than the walk ended. A pull request with no
-                        # update time cannot be placed against a bound at all and is
-                        # walked rather than guessed at.
-                        continue
-                pr_number = int(getattr(pull, "number", 0) or 0)
-                if _finished_and_unchanged(
-                    registry,
-                    repository=repository,
-                    pr_number=pr_number,
-                    updated_at=updated_at,
-                    plan=plan,
-                ):
-                    tally.skipped_finished += 1
-                    continue
-                tally.objects_read += 1
-                yield pull
-            if len(batch) < PAGE_SIZE:
-                tally.floor_unreached = True
+            short = yield from _emit_page_batch(batch, plan, tally, repository, registry)
+            if short == "floor":
+                return
+            if short == "short":
+                tally.note_floor_unreached()
                 return
             next_page += 1
     tally.gap(repository, None, "pull requests", _PAGE_CEILING_REASON)
+
+
+def _emit_page_batch(
+    batch: list[Any],
+    plan: BackfillPlan,
+    tally: _Tally,
+    repository: str,
+    registry: QuestionRegistry,
+) -> Generator[Any, None, str | None]:
+    """Yield one page's admissible pulls; return how the walk should continue.
+
+    ``"floor"`` ends the walk (older than the range), ``"short"`` ends it at a
+    short page; ``None`` advances to the next page. A generator -- not a list --
+    so the budget caller tripping mid-page leaves the same prefix captured as
+    the sequential walk did: ``objects_read`` is charged as each pull is handed
+    out, never for a page fetched but unconsumed.
+    """
+    for pull in batch:
+        updated_at = getattr(pull, "updated_at", None)
+        if updated_at is not None:
+            if _before_floor(updated_at, plan):
+                # Every later entry is older than this one, so the rest of the
+                # walk proves itself unnecessary.
+                return "floor"
+            if _above_ceiling(updated_at, plan):
+                # Too recent for the era named. This page is over, the next one
+                # is older, and the window may be on it — so this entry is
+                # skipped rather than the walk ended. A pull request with no
+                # update time cannot be placed against a bound at all and is
+                # walked rather than guessed at.
+                continue
+        pr_number = int(getattr(pull, "number", 0) or 0)
+        if _finished_and_unchanged(
+            registry,
+            repository=repository,
+            pr_number=pr_number,
+            updated_at=updated_at,
+            plan=plan,
+        ):
+            tally.note_skipped_finished()
+            continue
+        tally.note_read()
+        yield pull
+    if len(batch) < PAGE_SIZE:
+        return "short"
+    return None
 
 
 def _review_comments(
@@ -1145,28 +1230,13 @@ def _reconstruct_pull_request(
     # makes the pull request a run stops inside re-readable: it has no
     # finished receipt, so the next run reads it and stores only what is
     # missing.
-    finished = True
-
-    def _mark_unfinished() -> None:
-        nonlocal finished
-        finished = False
-
-    def _gap_unfinished(what: str) -> None:
-        tally.gap(repository, pr_number, what, _PAGE_CEILING_REASON)
-        _mark_unfinished()
-
+    tracker = _PassTracker()
     for review in _pages(
         lambda page: reader.list_reviews(owner, name, pr_number, page=page, per_page=PAGE_SIZE),
-        truncated=lambda: _gap_unfinished("reviews"),
+        truncated=lambda: tracker.gap_unfinished(tally, repository, pr_number, "reviews"),
     ):
-        submitted_at = getattr(review, "submitted_at", None)
-        if not _within_window(submitted_at, plan):
-            # Excluded by a bound, so never examined: an object the policy kept out
-            # is not one this run read, and counting it would make the count
-            # describe work that was not done.
-            continue
-        budget.reserve()
-        _reconstruct_review(
+        _reconstruct_one_review(
+            review,
             reader=reader,
             registry=registry,
             sink=sink,
@@ -1176,12 +1246,10 @@ def _reconstruct_pull_request(
             name=name,
             pr_number=pr_number,
             pull=pull,
-            review=review,
             budget=budget,
             tally=tally,
-            on_truncated=_mark_unfinished,
+            on_truncated=tracker.mark_unfinished,
         )
-
     _reconstruct_issue_comments(
         reader=reader,
         registry=registry,
@@ -1193,27 +1261,89 @@ def _reconstruct_pull_request(
         pr_number=pr_number,
         budget=budget,
         tally=tally,
-        on_truncated=_mark_unfinished,
+        on_truncated=tracker.mark_unfinished,
     )
+    tracker.record_receipt(registry, repository, pr_number, plan, getattr(pull, "updated_at", None))
 
-    # The pass end, in the pass's own terms: this pull request was walked to
-    # its last page under this window, so a later run under the same window
-    # whose listing timestamp is no newer can skip it. Stored comment
-    # timestamps are deliberately not the evidence -- an empty-bodied review is
-    # read and kept as nothing, and a pass can stop after one comment and
-    # before another, so the oldest and newest stored comments do not prove
-    # the middle was read. Only reaching this line proves it.
-    observed_at = getattr(pull, "updated_at", None)
-    if observed_at is not None:
-        registry.record_backfill_receipt(
-            repo=repository,
-            pr_number=pr_number,
-            observed_updated_at=_normalise(observed_at),
-            window_since=plan.since,
-            window_until=plan.until,
-            authorized_associations=plan.authorized_associations,
-            finished=finished,
-        )
+
+class _PassTracker:
+    """Whether the current pull request's walk finished every page it needed."""
+
+    def __init__(self) -> None:
+        self.finished = True
+
+    def mark_unfinished(self) -> None:
+        self.finished = False
+
+    def gap_unfinished(self, tally: _Tally, repository: str, pr_number: int, what: str) -> None:
+        tally.gap(repository, pr_number, what, _PAGE_CEILING_REASON)
+        self.mark_unfinished()
+
+    def record_receipt(
+        self,
+        registry: QuestionRegistry,
+        repository: str,
+        pr_number: int,
+        plan: BackfillPlan,
+        observed_at: Any,
+    ) -> None:
+        # The pass end, in the pass's own terms: this pull request was walked to
+        # its last page under this window, so a later run under the same window
+        # whose listing timestamp is no newer can skip it. Stored comment
+        # timestamps are deliberately not the evidence -- an empty-bodied review is
+        # read and kept as nothing, and a pass can stop after one comment and
+        # before another, so the oldest and newest stored comments do not prove
+        # the middle was read. Only reaching this line proves it.
+        if observed_at is not None:
+            registry.record_backfill_receipt(
+                repo=repository,
+                pr_number=pr_number,
+                observed_updated_at=_normalise(observed_at),
+                window_since=plan.since,
+                window_until=plan.until,
+                authorized_associations=plan.authorized_associations,
+                finished=self.finished,
+            )
+
+
+def _reconstruct_one_review(
+    review: Any,
+    *,
+    reader: HistoryReader,
+    registry: QuestionRegistry,
+    sink: KnowledgeSink,
+    plan: BackfillPlan,
+    repository: str,
+    owner: str,
+    name: str,
+    pr_number: int,
+    pull: Any,
+    budget: _Budget,
+    tally: _Tally,
+    on_truncated: Callable[[], None] | None,
+) -> None:
+    submitted_at = getattr(review, "submitted_at", None)
+    if not _within_window(submitted_at, plan):
+        # Excluded by a bound, so never examined: an object the policy kept out
+        # is not one this run read, and counting it would make the count
+        # describe work that was not done.
+        return
+    budget.reserve()
+    _reconstruct_review(
+        reader=reader,
+        registry=registry,
+        sink=sink,
+        plan=plan,
+        repository=repository,
+        owner=owner,
+        name=name,
+        pr_number=pr_number,
+        pull=pull,
+        review=review,
+        budget=budget,
+        tally=tally,
+        on_truncated=on_truncated,
+    )
 
 
 def _reconstruct_review(
@@ -1236,20 +1366,48 @@ def _reconstruct_review(
     user = getattr(review, "user", None)
     login = getattr(user, "login", None)
     what = f"review {review_id}"
+    return _capture_reconstructed_review(
+        reader=reader,
+        registry=registry,
+        sink=sink,
+        plan=plan,
+        repository=repository,
+        owner=owner,
+        name=name,
+        pr_number=pr_number,
+        pull=pull,
+        review=review,
+        review_id=review_id,
+        login=login,
+        what=what,
+        budget=budget,
+        tally=tally,
+        on_truncated=on_truncated,
+    )
+
+
+def _read_review_comments(
+    reader: HistoryReader,
+    owner: str,
+    name: str,
+    pr_number: int,
+    review_id: int,
+    repository: str,
+    tally: _Tally,
+    what: str,
+    *,
+    on_truncated: Callable[[], None] | None,
+    budget: _Budget,
+) -> list[Any] | None:
+    """Fetch one review's inline comments, or None when the review is gone."""
 
     def _comments_truncated() -> None:
         tally.gap(repository, pr_number, what, _PAGE_CEILING_REASON)
         if on_truncated is not None:
             on_truncated()
 
-    # The inline comments are read before the review is handed to a collector,
-    # which is the whole of requirement "a deleted object produces nothing". A
-    # review deleted after the fact has no comments left to list, so the 404 is how
-    # this learns the object is gone — and the verdict, which would still read
-    # perfectly well on its own, is not written. A record for a review the forge has
-    # withdrawn is not a reconstruction of anything.
     try:
-        comments = _review_comments(
+        return _review_comments(
             reader,
             owner,
             name,
@@ -1268,57 +1426,64 @@ def _reconstruct_review(
             # Read, and nothing reconstructed: the reservation was for work this
             # object would do, and it is not going to do any.
             budget.refund()
-            return
+            return None
         raise
 
-    tally.objects_read += 1
+
+def _capture_reconstructed_review(
+    *,
+    reader: HistoryReader,
+    registry: QuestionRegistry,
+    sink: KnowledgeSink,
+    plan: BackfillPlan,
+    repository: str,
+    owner: str,
+    name: str,
+    pr_number: int,
+    pull: Any,
+    review: Any,
+    review_id: int,
+    login: str | None,
+    what: str,
+    budget: _Budget,
+    tally: _Tally,
+    on_truncated: Callable[[], None] | None = None,
+) -> None:
+    # The inline comments are read before the review is handed to a collector,
+    # which is the whole of requirement "a deleted object produces nothing". A
+    # review deleted after the fact has no comments left to list, so the 404 is how
+    # this learns the object is gone — and the verdict, which would still read
+    # perfectly well on its own, is not written. A record for a review the forge has
+    # withdrawn is not a reconstruction of anything.
+    comments = _read_review_comments(
+        reader,
+        owner,
+        name,
+        pr_number,
+        review_id,
+        repository,
+        tally,
+        what,
+        on_truncated=on_truncated,
+        budget=budget,
+    )
+    if comments is None:
+        return
+    tally.note_read()
     pull_author = getattr(getattr(pull, "user", None), "login", None)
     try:
-        result = process_review_event_outcome(
-            repo=repository,
-            pr_number=pr_number,
-            review_id=review_id,
-            review_state=str(getattr(review, "state", "") or ""),
-            review_body=str(getattr(review, "body", "") or ""),
-            review_author=login,
-            pr_author_account=pull_author,
-            review_submitted_at=getattr(review, "submitted_at", None),
-            review_author_association=getattr(review, "author_association", None),
-            review_author_type=getattr(getattr(review, "user", None), "type", None),
-            comments=[
-                {
-                    "id": getattr(comment, "id", None),
-                    "body": getattr(comment, "body", "") or "",
-                    "path": getattr(comment, "path", None),
-                    "line": getattr(comment, "line", None),
-                    "original_line": getattr(comment, "original_line", None),
-                    "side": getattr(comment, "side", None),
-                    "diff_hunk": getattr(comment, "diff_hunk", None),
-                    "commit_id": getattr(comment, "commit_id", None),
-                    "in_reply_to_id": getattr(comment, "in_reply_to_id", None),
-                }
-                for comment in comments
-            ],
+        result = _collect_reconstructed_review(
+            review,
+            comments,
+            pull=pull,
+            pull_author=pull_author,
             registry=registry,
             sink=sink,
-            # No delivery: nothing was delivered to a backfill, and the stamp on the
-            # sink is what says so on the record.
-            delivery_id=None,
-            pr_opened_at=getattr(pull, "created_at", None),
-            # No head, and no file list. The pull request's current head is not the
-            # head this review was written against, and anchoring six-month-old
-            # evidence to a commit from this morning is the specific wrongness the
-            # anchor field must never carry: a wrong anchor is checkable, so it is
-            # worse than a missing one. ``None`` means "not available", which is the
-            # truth. The file list is one more authenticated read per change, against
-            # a budget that history makes unbounded, so it is absent here for the same
-            # reason and says so.
-            head_sha=None,
-            files_changed=None,
-            # What the operator asked this run to admit. ``None`` is the default set,
-            # and is passed through as ``None`` rather than resolved here so that the
-            # default lives in exactly one place.
-            authorized_associations=plan.authorized_associations,
+            plan=plan,
+            repository=repository,
+            pr_number=pr_number,
+            review_id=review_id,
+            login=login,
         )
     except UnanchorableReadError as exc:
         # The collector released its claim on the way out, so nothing was written
@@ -1328,12 +1493,76 @@ def _reconstruct_review(
         tally.gap(repository, pr_number, what, str(exc))
         budget.refund()
         return
+    _count_reconstructed_review(result, tally, budget)
+
+
+def _collect_reconstructed_review(
+    review: Any,
+    comments: list[Any],
+    *,
+    pull: Any,
+    pull_author: str | None,
+    registry: QuestionRegistry,
+    sink: KnowledgeSink,
+    plan: BackfillPlan,
+    repository: str,
+    pr_number: int,
+    review_id: int,
+    login: str | None,
+) -> ReviewCaptureResult:
+    return process_review_event_outcome(
+        repo=repository,
+        pr_number=pr_number,
+        review_id=review_id,
+        review_state=str(getattr(review, "state", "") or ""),
+        review_body=str(getattr(review, "body", "") or ""),
+        review_author=login,
+        pr_author_account=pull_author,
+        review_submitted_at=getattr(review, "submitted_at", None),
+        review_author_association=getattr(review, "author_association", None),
+        review_author_type=getattr(getattr(review, "user", None), "type", None),
+        comments=[
+            {
+                "id": getattr(comment, "id", None),
+                "body": getattr(comment, "body", "") or "",
+                "path": getattr(comment, "path", None),
+                "line": getattr(comment, "line", None),
+                "original_line": getattr(comment, "original_line", None),
+                "side": getattr(comment, "side", None),
+                "diff_hunk": getattr(comment, "diff_hunk", None),
+                "commit_id": getattr(comment, "commit_id", None),
+                "in_reply_to_id": getattr(comment, "in_reply_to_id", None),
+            }
+            for comment in comments
+        ],
+        registry=registry,
+        sink=sink,
+        # No delivery: nothing was delivered to a backfill, and the stamp on the
+        # sink is what says so on the record.
+        delivery_id=None,
+        pr_opened_at=getattr(pull, "created_at", None),
+        # No head, and no file list. The pull request's current head is not the
+        # head this review was written against, and anchoring six-month-old
+        # evidence to a commit from this morning is the specific wrongness the
+        # anchor field must never carry: a wrong anchor is checkable, so it is
+        # worse than a missing one. ``None`` means "not available", which is the
+        # truth. The file list is one more authenticated read per change, against
+        # a budget that history makes unbounded, so it is absent here for the same
+        # reason and says so.
+        head_sha=None,
+        files_changed=None,
+        # What the operator asked this run to admit. ``None`` is the default set,
+        # and is passed through as ``None`` rather than resolved here so that the
+        # default lives in exactly one place.
+        authorized_associations=plan.authorized_associations,
+    )
+
+
+def _count_reconstructed_review(
+    result: ReviewCaptureResult, tally: _Tally, budget: _Budget
+) -> None:
     written, already = capture_counts(result)
-    tally.records_written += written
-    if written:
-        tally.objects_new += 1
-    if already:
-        tally.already_present += 1
+    tally.note_stored(written, already)
     if not written:
         # Read, and stored nothing. Not a gap and not a duplicate — the difference
         # between the two is the only thing that makes the other counts mean
@@ -1341,16 +1570,7 @@ def _reconstruct_review(
         # run for reading objects that will never store anything is what stopped this
         # walk advancing at all.
         if not already:
-            tally.silent += 1
-            # Which gate, because the reason decides what the number means. A review
-            # with nothing capturable is an absence of review; one refused by
-            # ``author_association`` is review activity the corpus is throwing away,
-            # and those two are indistinguishable at this point unless they are told
-            # apart. The association gate only fires for a run that narrowed the policy
-            # deliberately -- the default admits every association -- so a run that
-            # reports it is reporting its own configuration, not a gap in the forge.
-            reason = str(getattr(result, "refusal", "") or "") or "unknown"
-            tally.refusals[reason] = tally.refusals.get(reason, 0) + 1
+            tally.note_silent(str(getattr(result, "refusal", "") or ""))
         budget.refund()
 
 
@@ -1404,55 +1624,79 @@ def _reconstruct_issue_comments(
         for comment in comments
         if (marker := extract_question_id_from_comment_body(getattr(comment, "body", "") or ""))
     }
-
     for comment in comments:
-        created_at = getattr(comment, "created_at", None)
-        if not _within_window(created_at, plan):
-            continue
-        budget.reserve()
-        tally.objects_read += 1
+        _reconstruct_one_issue_comment(
+            comment,
+            reader=reader,
+            registry=registry,
+            sink=sink,
+            plan=plan,
+            repository=repository,
+            pr_number=pr_number,
+            questions=questions,
+            budget=budget,
+            tally=tally,
+        )
 
-        body = getattr(comment, "body", "") or ""
-        question_id = extract_answer_question_id_from_comment_body(body)
-        parent = questions.get(question_id) if question_id else None
-        if question_id is None or parent is None:
-            tally.silent += 1
-            budget.refund()
-            continue
 
-        try:
-            outcome = process_comment_reply_outcome(
-                new_comment_id=int(getattr(comment, "id", 0) or 0),
-                new_comment_body=body,
-                new_comment_author=getattr(getattr(comment, "user", None), "login", None),
-                new_comment_created_at=created_at,
-                parent_comment_id=int(getattr(parent, "id", 0) or 0),
-                repo=repository,
-                pr_number=pr_number,
-                registry=registry,
-                sink=sink,
-                question_id=question_id,
-                new_comment_author_association=getattr(comment, "author_association", None),
-                new_comment_author_type=getattr(getattr(comment, "user", None), "type", None),
-                delivery_id=None,
-                parent_agent_claim=extract_agent_claim(getattr(parent, "body", "") or ""),
-            )
-        except UnanchorableReadError as exc:
-            # As above: the claim was released, nothing was written, and this is a
-            # gap in what could be reconstructed rather than a failed run.
-            tally.gap(repository, pr_number, f"comment {getattr(comment, 'id', '?')}", str(exc))
-            budget.refund()
-            continue
-        if outcome is not None:
-            tally.records_written += 1
-            tally.objects_new += 1
-            continue
-        # The collector refuses for several reasons, and only one of them means the
-        # record is already there. The registry is asked which, because a duplicate
-        # and a refusal are different facts and reporting one as the other is how a
-        # resumable run starts looking like it did work it did not do.
-        if registry.answer_comment_seen(int(getattr(comment, "id", 0) or 0)):
-            tally.already_present += 1
-        else:
-            tally.silent += 1
+def _reconstruct_one_issue_comment(
+    comment: Any,
+    *,
+    reader: HistoryReader,
+    registry: QuestionRegistry,
+    sink: KnowledgeSink,
+    plan: BackfillPlan,
+    repository: str,
+    pr_number: int,
+    questions: dict[str, Any],
+    budget: _Budget,
+    tally: _Tally,
+) -> None:
+    created_at = getattr(comment, "created_at", None)
+    if not _within_window(created_at, plan):
+        return
+    budget.reserve()
+    tally.note_read()
+
+    body = getattr(comment, "body", "") or ""
+    question_id = extract_answer_question_id_from_comment_body(body)
+    parent = questions.get(question_id) if question_id else None
+    if question_id is None or parent is None:
+        tally.note_silent(None)
         budget.refund()
+        return
+    try:
+        outcome = process_comment_reply_outcome(
+            new_comment_id=int(getattr(comment, "id", 0) or 0),
+            new_comment_body=body,
+            new_comment_author=getattr(getattr(comment, "user", None), "login", None),
+            new_comment_created_at=created_at,
+            parent_comment_id=int(getattr(parent, "id", 0) or 0),
+            repo=repository,
+            pr_number=pr_number,
+            registry=registry,
+            sink=sink,
+            question_id=question_id,
+            new_comment_author_association=getattr(comment, "author_association", None),
+            new_comment_author_type=getattr(getattr(comment, "user", None), "type", None),
+            delivery_id=None,
+            parent_agent_claim=extract_agent_claim(getattr(parent, "body", "") or ""),
+        )
+    except UnanchorableReadError as exc:
+        # As above: the claim was released, nothing was written, and this is a
+        # gap in what could be reconstructed rather than a failed run.
+        tally.gap(repository, pr_number, f"comment {getattr(comment, 'id', '?')}", str(exc))
+        budget.refund()
+        return
+    if outcome is not None:
+        tally.note_stored(1, False)
+        return
+    # The collector refuses for several reasons, and only one of them means the
+    # record is already there. The registry is asked which, because a duplicate
+    # and a refusal are different facts and reporting one as the other is how a
+    # resumable run starts looking like it did work it did not do.
+    if registry.answer_comment_seen(int(getattr(comment, "id", 0) or 0)):
+        tally.note_already_present()
+    else:
+        tally.note_silent(None)
+    budget.refund()

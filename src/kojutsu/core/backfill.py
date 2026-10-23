@@ -37,7 +37,7 @@ shortfalls all travel together in :class:`BackfillCoverage`.
 from __future__ import annotations
 
 import traceback
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date
 from typing import Any
 
@@ -292,7 +292,60 @@ def _collect_for_pull_request(
         for comment in comments
         if (marker := extract_question_id_from_comment_body(comment.body))
     }
+    answers, rationales = _collect_comment_captures(
+        comments,
+        questions,
+        registry=registry,
+        sink=sink,
+        repository=repository,
+        pr_number=pr_number,
+        branch=branch,
+    )
 
+    # Clarifications last, so the registry already knows which comments are
+    # questions and which are answers and can exclude them. A comment captured
+    # under two headings would be counted twice and would read as "nobody asked"
+    # about something that was in fact asked.
+    clarifications = len(
+        collect_clarifications(
+            repo=repository,
+            pr_number=pr_number,
+            comments=comments,
+            registry=registry,
+            sink=sink,
+        )
+    )
+    reviews, reviews_truncated = _capture_reviews(
+        client,
+        registry,
+        sink,
+        owner=owner,
+        repo=repo,
+        repository=repository,
+        pr_number=pr_number,
+        pr_author_account=pr_author_account,
+    )
+    return (
+        len(comments),
+        answers,
+        rationales,
+        clarifications,
+        reviews,
+        (truncated or reviews_truncated),
+    )
+
+
+def _collect_comment_captures(
+    comments: list[Any],
+    questions: dict[str, Any],
+    *,
+    registry: QuestionRegistry,
+    sink: KnowledgeSink,
+    repository: str,
+    pr_number: int,
+    branch: str,
+) -> tuple[int, int]:
+    """Capture rationales and answers from one PR's comments. Returns (answers, rationales)."""
     answers = 0
     rationales = 0
     for comment in comments:
@@ -334,38 +387,7 @@ def _collect_for_pull_request(
         )
         if created:
             answers += 1
-
-    # Clarifications last, so the registry already knows which comments are
-    # questions and which are answers and can exclude them. A comment captured
-    # under two headings would be counted twice and would read as "nobody asked"
-    # about something that was in fact asked.
-    clarifications = len(
-        collect_clarifications(
-            repo=repository,
-            pr_number=pr_number,
-            comments=comments,
-            registry=registry,
-            sink=sink,
-        )
-    )
-    reviews, reviews_truncated = _capture_reviews(
-        client,
-        registry,
-        sink,
-        owner=owner,
-        repo=repo,
-        repository=repository,
-        pr_number=pr_number,
-        pr_author_account=pr_author_account,
-    )
-    return (
-        len(comments),
-        answers,
-        rationales,
-        clarifications,
-        reviews,
-        (truncated or reviews_truncated),
-    )
+    return answers, rationales
 
 
 def run_backfill(
@@ -404,59 +426,9 @@ def run_backfill(
         limit=limit,
         settings=settings,
     )
-
-    prs_read = 0
-    prs_failed = 0
-    prs_truncated = 0
-    comments_read = 0
-    answers = 0
-    rationales = 0
-    clarifications = 0
-    reviews = 0
-    errors: list[str] = []
-
+    tally = _BackfillTally()
     for pull in search.pull_requests:
-        head = pull.head or {}
-        branch = str(head.get("ref", "") or "") if isinstance(head, dict) else ""
-        try:
-            (
-                read,
-                captured_answers,
-                captured_rationales,
-                captured_clarifications,
-                captured_reviews,
-                read_truncated,
-            ) = _collect_for_pull_request(
-                client,
-                registry,
-                sink,
-                owner=owner,
-                repo=repo,
-                repository=repository,
-                pr_number=pull.number,
-                branch=branch,
-                pr_author_account=(pull.user.login if pull.user is not None else None),
-            )
-        except Exception as exc:  # one unread PR must not end the run
-            prs_failed += 1
-            tb = traceback.format_exc(limit=3)
-            # Bounded: last line carries the cause, full chain would flood coverage.
-            tb_tail = "\n".join(tb.strip().splitlines()[-4:])
-            errors.append(f"{repository}#{pull.number}: {type(exc).__name__}: {exc}\n{tb_tail}")
-            continue
-        prs_read += 1
-        comments_read += read
-        answers += captured_answers
-        rationales += captured_rationales
-        clarifications += captured_clarifications
-        reviews += captured_reviews
-        if read_truncated:
-            prs_truncated += 1
-            errors.append(
-                f"{repository}#{pull.number}: comment listing hit the page cap; "
-                "comments past the cap were not collected."
-            )
-
+        _collect_one_pull_request(pull, tally, client, registry, sink, owner, repo, repository)
     start, end = validate_pull_request_range(since, until)
     return BackfillCoverage(
         repository=repository,
@@ -465,16 +437,100 @@ def run_backfill(
         pull_requests=len(search.pull_requests),
         search_total_count=search.total_count,
         truncated=search.truncated,
-        prs_read=prs_read,
-        prs_failed=prs_failed,
-        prs_truncated=prs_truncated,
-        comments_read=comments_read,
-        answers_captured=answers,
-        rationales_captured=rationales,
-        clarifications_captured=clarifications,
-        reviews_captured=reviews,
+        prs_read=tally.prs_read,
+        prs_failed=tally.prs_failed,
+        prs_truncated=tally.prs_truncated,
+        comments_read=tally.comments_read,
+        answers_captured=tally.answers,
+        rationales_captured=tally.rationales,
+        clarifications_captured=tally.clarifications,
+        reviews_captured=tally.reviews,
         out_of_range=search.out_of_range,
         undated=search.undated,
         search_pages=search.pages_fetched,
-        errors=tuple(errors),
+        errors=tuple(tally.errors),
     )
+
+
+@dataclass
+class _BackfillTally:
+    """Counters for one backfill run. Written only through the methods below."""
+
+    prs_read: int = 0
+    prs_failed: int = 0
+    prs_truncated: int = 0
+    comments_read: int = 0
+    answers: int = 0
+    rationales: int = 0
+    clarifications: int = 0
+    reviews: int = 0
+    errors: list[str] = field(default_factory=list)
+
+    def note_collected(
+        self, read: int, answers: int, rationales: int, clarifications: int, reviews: int
+    ) -> None:
+        self.prs_read += 1
+        self.comments_read += read
+        self.answers += answers
+        self.rationales += rationales
+        self.clarifications += clarifications
+        self.reviews += reviews
+
+    def note_truncated(self, repository: str, pr_number: int) -> None:
+        self.prs_truncated += 1
+        self.errors.append(
+            f"{repository}#{pr_number}: comment listing hit the page cap; "
+            "comments past the cap were not collected."
+        )
+
+    def note_failed(
+        self, repository: str, pr_number: int, exc: Exception, traceback_tail: str
+    ) -> None:
+        self.prs_failed += 1
+        self.errors.append(
+            f"{repository}#{pr_number}: {type(exc).__name__}: {exc}\n{traceback_tail}"
+        )
+
+
+def _collect_one_pull_request(
+    pull: Any,
+    tally: _BackfillTally,
+    client: GitHubClient,
+    registry: QuestionRegistry,
+    sink: KnowledgeSink,
+    owner: str,
+    repo: str,
+    repository: str,
+) -> None:
+    head = pull.head or {}
+    branch = str(head.get("ref", "") or "") if isinstance(head, dict) else ""
+    try:
+        (
+            read,
+            captured_answers,
+            captured_rationales,
+            captured_clarifications,
+            captured_reviews,
+            read_truncated,
+        ) = _collect_for_pull_request(
+            client,
+            registry,
+            sink,
+            owner=owner,
+            repo=repo,
+            repository=repository,
+            pr_number=pull.number,
+            branch=branch,
+            pr_author_account=(pull.user.login if pull.user is not None else None),
+        )
+    except Exception as exc:  # one unread PR must not end the run
+        tb = traceback.format_exc(limit=3)
+        # Bounded: last line carries the cause, full chain would flood coverage.
+        tb_tail = "\n".join(tb.strip().splitlines()[-4:])
+        tally.note_failed(repository, pull.number, exc, tb_tail)
+        return
+    tally.note_collected(
+        read, captured_answers, captured_rationales, captured_clarifications, captured_reviews
+    )
+    if read_truncated:
+        tally.note_truncated(repository, pull.number)

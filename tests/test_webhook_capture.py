@@ -11,6 +11,7 @@ from typing import ClassVar
 import httpx
 import pytest
 from fastapi.testclient import TestClient
+from tests.support import execute_write, query_value, table_count
 
 from kojutsu import runtime as runtime_module
 from kojutsu.core.knowledge_sink import (
@@ -138,7 +139,7 @@ def test_issue_comment_reply_is_captured(tmp_path, monkeypatch) -> None:
         question_category="design_decision",
     )
     sink = FakeSink()
-    monkeypatch.setattr(runtime_module, "_runtime", FakeRuntime(registry, sink))
+    runtime_module.install_runtime(FakeRuntime(registry, sink))
     monkeypatch.setenv("GITHUB_TOKEN", "x")
     monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", WEBHOOK_SECRET)
     monkeypatch.setattr("kojutsu.webhook.server.GitHubClient", FakeGitHubClient)
@@ -180,7 +181,7 @@ def test_interleaved_unrelated_comment_is_ignored(tmp_path, monkeypatch) -> None
         question_category="design_decision",
     )
     sink = FakeSink()
-    monkeypatch.setattr(runtime_module, "_runtime", FakeRuntime(registry, sink))
+    runtime_module.install_runtime(FakeRuntime(registry, sink))
     monkeypatch.setenv("GITHUB_TOKEN", "x")
     monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", WEBHOOK_SECRET)
     monkeypatch.setattr("kojutsu.webhook.server.GitHubClient", FakeGitHubClient)
@@ -211,7 +212,7 @@ def test_interleaved_unrelated_comment_is_ignored(tmp_path, monkeypatch) -> None
 def test_late_question_visibility_returns_pending(tmp_path, monkeypatch) -> None:
     registry = SqliteQuestionRegistry(tmp_path / "r.db")
     sink = FakeSink()
-    monkeypatch.setattr(runtime_module, "_runtime", FakeRuntime(registry, sink))
+    runtime_module.install_runtime(FakeRuntime(registry, sink))
     monkeypatch.setenv("GITHUB_TOKEN", "x")
     monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", WEBHOOK_SECRET)
     monkeypatch.setattr("kojutsu.webhook.server.GitHubClient", FakeGitHubClient)
@@ -248,7 +249,7 @@ def _pr_payload() -> dict:
 def test_pull_request_state_change_is_captured(tmp_path, monkeypatch) -> None:
     registry = SqliteQuestionRegistry(tmp_path / "r.db")
     sink = FakeSink()
-    monkeypatch.setattr(runtime_module, "_runtime", FakeRuntime(registry, sink))
+    runtime_module.install_runtime(FakeRuntime(registry, sink))
     monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", WEBHOOK_SECRET)
 
     response = _post_signed(_pr_payload(), "pull_request")
@@ -261,7 +262,7 @@ def test_pull_request_state_change_is_captured(tmp_path, monkeypatch) -> None:
 def test_pr_semantic_identity_ignores_serialization_and_delivery_id(tmp_path, monkeypatch) -> None:
     registry = SqliteQuestionRegistry(tmp_path / "r.db")
     sink = FakeSink()
-    monkeypatch.setattr(runtime_module, "_runtime", FakeRuntime(registry, sink))
+    runtime_module.install_runtime(FakeRuntime(registry, sink))
     monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", WEBHOOK_SECRET)
     first_payload = _pr_payload()
     second_payload = _pr_payload()
@@ -276,7 +277,7 @@ def test_pr_semantic_identity_ignores_serialization_and_delivery_id(tmp_path, mo
     assert second.status_code == 200
     assert second.json() == {"status": "processed", "stored": False}
     assert len(sink.entries) == 1
-    assert registry._db.execute("SELECT COUNT(*) FROM pr_state_changes").fetchone()[0] == 1
+    assert table_count(registry.path, "pr_state_changes") == 1
 
 
 def test_webhook_reports_queued_delivery(tmp_path, monkeypatch) -> None:
@@ -291,7 +292,7 @@ def test_webhook_reports_queued_delivery(tmp_path, monkeypatch) -> None:
 
     registry = SqliteQuestionRegistry(tmp_path / "r.db")
     sink = QueuedSink()
-    monkeypatch.setattr(runtime_module, "_runtime", FakeRuntime(registry, sink))
+    runtime_module.install_runtime(FakeRuntime(registry, sink))
     monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", WEBHOOK_SECRET)
 
     response = _post_signed(_pr_payload(), "pull_request")
@@ -313,16 +314,19 @@ def test_dead_lettered_capture_is_retryable_and_not_completed(tmp_path, monkeypa
     registry = SqliteQuestionRegistry(tmp_path / "r.db")
     sink = DeadSink()
     runtime = FakeRuntime(registry, sink)
-    monkeypatch.setattr(runtime_module, "_runtime", runtime)
+    runtime_module.install_runtime(runtime)
     monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", WEBHOOK_SECRET)
 
     first = _post_signed(_pr_payload(), "pull_request", DELIVERY_ID)
-    delivery_status = registry._db.execute(
-        "SELECT status FROM webhook_deliveries WHERE delivery_id = ?", (DELIVERY_ID,)
-    ).fetchone()[0]
-    pr_status = registry._db.execute(
-        "SELECT status FROM pr_state_changes WHERE repo = 'org/repo' AND pr_number = 5"
-    ).fetchone()[0]
+    delivery_status = query_value(
+        registry.path,
+        "SELECT status FROM webhook_deliveries WHERE delivery_id = ?",
+        (DELIVERY_ID,),
+    )
+    pr_status = query_value(
+        registry.path,
+        "SELECT status FROM pr_state_changes WHERE repo = 'org/repo' AND pr_number = 5",
+    )
     runtime.sink = FakeSink()
     second = _post_signed(_pr_payload(), "pull_request", DELIVERY_ID)
 
@@ -339,7 +343,7 @@ def test_active_delivery_returns_retryable_conflict(tmp_path, monkeypatch) -> No
     payload_hash = hashlib.sha256(json.dumps(_pr_payload()).encode()).hexdigest()
     claim = registry.claim_delivery(DELIVERY_ID, "org/repo", "pull_request", payload_hash)
     assert claim not in {"active", "conflict", "duplicate"}
-    monkeypatch.setattr(runtime_module, "_runtime", FakeRuntime(registry, FakeSink()))
+    runtime_module.install_runtime(FakeRuntime(registry, FakeSink()))
     monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", WEBHOOK_SECRET)
 
     response = _post_signed(_pr_payload(), "pull_request", DELIVERY_ID)
@@ -347,15 +351,17 @@ def test_active_delivery_returns_retryable_conflict(tmp_path, monkeypatch) -> No
     assert response.status_code == 503
     assert response.headers["Retry-After"] == "5"
     assert (
-        registry._db.execute(
-            "SELECT status FROM webhook_deliveries WHERE delivery_id = ?", (DELIVERY_ID,)
-        ).fetchone()[0]
+        query_value(
+            registry.path,
+            "SELECT status FROM webhook_deliveries WHERE delivery_id = ?",
+            (DELIVERY_ID,),
+        )
         == "processing"
     )
 
 
 def test_capture_reports_when_tanseki_unconfigured(monkeypatch) -> None:
-    monkeypatch.setattr(runtime_module, "_runtime", None)
+    runtime_module.install_runtime(None)
     monkeypatch.setenv("TANSEKI_URL", "")
     monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", WEBHOOK_SECRET)
 
@@ -369,7 +375,7 @@ def test_capture_reports_when_tanseki_unconfigured(monkeypatch) -> None:
 def test_duplicate_delivery_is_ignored(tmp_path, monkeypatch) -> None:
     registry = SqliteQuestionRegistry(tmp_path / "r.db")
     sink = FakeSink()
-    monkeypatch.setattr(runtime_module, "_runtime", FakeRuntime(registry, sink))
+    runtime_module.install_runtime(FakeRuntime(registry, sink))
     monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", WEBHOOK_SECRET)
 
     first = _post_signed(_pr_payload(), "pull_request", delivery_id=DELIVERY_ID)
@@ -384,7 +390,7 @@ def test_duplicate_delivery_is_ignored(tmp_path, monkeypatch) -> None:
 
 def test_repository_allowlist_rejects_unconfigured_repo(tmp_path, monkeypatch) -> None:
     registry = SqliteQuestionRegistry(tmp_path / "r.db")
-    monkeypatch.setattr(runtime_module, "_runtime", FakeRuntime(registry, FakeSink()))
+    runtime_module.install_runtime(FakeRuntime(registry, FakeSink()))
     monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", WEBHOOK_SECRET)
     monkeypatch.setenv("GITHUB_WEBHOOK_ALLOWED_REPOSITORIES", "org/allowed")
 
@@ -418,7 +424,7 @@ def test_webhook_rejects_unconfigured_authentication(monkeypatch) -> None:
     )
 
     assert response.status_code == 503
-    assert response.json() == {"detail": "Webhook authentication is not configured"}
+    assert response.json() == {"detail": "Service Unavailable"}
 
 
 def test_webhook_rejects_invalid_signature(monkeypatch) -> None:
@@ -455,7 +461,7 @@ def test_webhook_rejects_missing_or_invalid_delivery_identity(monkeypatch) -> No
 def test_reused_delivery_identity_with_different_payload_is_rejected(tmp_path, monkeypatch) -> None:
     registry = SqliteQuestionRegistry(tmp_path / "r.db")
     sink = FakeSink()
-    monkeypatch.setattr(runtime_module, "_runtime", FakeRuntime(registry, sink))
+    runtime_module.install_runtime(FakeRuntime(registry, sink))
     monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", WEBHOOK_SECRET)
 
     first_payload = _pr_payload()
@@ -473,7 +479,7 @@ def test_reused_delivery_identity_with_different_payload_is_rejected(tmp_path, m
 def test_pending_delivery_is_released_for_retry(tmp_path, monkeypatch) -> None:
     registry = SqliteQuestionRegistry(tmp_path / "r.db")
     sink = FakeSink()
-    monkeypatch.setattr(runtime_module, "_runtime", FakeRuntime(registry, sink))
+    runtime_module.install_runtime(FakeRuntime(registry, sink))
     monkeypatch.setenv("GITHUB_TOKEN", "x")
     monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", WEBHOOK_SECRET)
     monkeypatch.setattr("kojutsu.webhook.server.GitHubClient", FakeGitHubClient)
@@ -505,7 +511,7 @@ def test_pending_delivery_is_released_for_retry(tmp_path, monkeypatch) -> None:
 def test_no_github_token_returns_retryable_failure_before_claim(tmp_path, monkeypatch) -> None:
     registry = SqliteQuestionRegistry(tmp_path / "r.db")
     sink = FakeSink()
-    monkeypatch.setattr(runtime_module, "_runtime", FakeRuntime(registry, sink))
+    runtime_module.install_runtime(FakeRuntime(registry, sink))
     monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", WEBHOOK_SECRET)
     monkeypatch.setattr("kojutsu.webhook.server.GitHubClient", FakeGitHubClient)
     FakeGitHubClient.comments = [
@@ -546,7 +552,7 @@ def test_processing_failure_releases_delivery_for_retry(tmp_path, monkeypatch) -
 
     registry = SqliteQuestionRegistry(tmp_path / "r.db")
     sink = FailOnceSink()
-    monkeypatch.setattr(runtime_module, "_runtime", FakeRuntime(registry, sink))
+    runtime_module.install_runtime(FakeRuntime(registry, sink))
     monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", WEBHOOK_SECRET)
 
     first = _post_signed(_pr_payload(), "pull_request", DELIVERY_ID)
@@ -565,7 +571,7 @@ def test_delivery_release_failure_remains_active_and_retryable(tmp_path, monkeyp
 
     registry = SqliteQuestionRegistry(tmp_path / "r.db")
     monkeypatch.setattr(registry, "release_delivery", lambda *_args: False)
-    monkeypatch.setattr(runtime_module, "_runtime", FakeRuntime(registry, FailingSink()))
+    runtime_module.install_runtime(FakeRuntime(registry, FailingSink()))
     monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", WEBHOOK_SECRET)
 
     failed_release = _post_signed(_pr_payload(), "pull_request", DELIVERY_ID)
@@ -576,16 +582,18 @@ def test_delivery_release_failure_remains_active_and_retryable(tmp_path, monkeyp
     assert active_retry.status_code == 503
     assert "already being processed" in active_retry.json()["detail"]
     assert (
-        registry._db.execute(
-            "SELECT status FROM webhook_deliveries WHERE delivery_id = ?", (DELIVERY_ID,)
-        ).fetchone()[0]
+        query_value(
+            registry.path,
+            "SELECT status FROM webhook_deliveries WHERE delivery_id = ?",
+            (DELIVERY_ID,),
+        )
         == "processing"
     )
 
 
 def test_empty_allowlist_denies_webhook_by_default(tmp_path, monkeypatch) -> None:
     registry = SqliteQuestionRegistry(tmp_path / "r.db")
-    monkeypatch.setattr(runtime_module, "_runtime", FakeRuntime(registry, FakeSink()))
+    runtime_module.install_runtime(FakeRuntime(registry, FakeSink()))
     monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", WEBHOOK_SECRET)
     monkeypatch.delenv("GITHUB_WEBHOOK_ALLOWED_REPOSITORIES", raising=False)
 
@@ -599,7 +607,7 @@ def test_wildcard_does_not_bypass_allowlist_on_public_url(tmp_path, monkeypatch)
     public_client = TestClient(public_app)
     registry = SqliteQuestionRegistry(tmp_path / "r.db")
     sink = FakeSink()
-    monkeypatch.setattr(runtime_module, "_runtime", FakeRuntime(registry, sink))
+    runtime_module.install_runtime(FakeRuntime(registry, sink))
     monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", WEBHOOK_SECRET)
     monkeypatch.setenv("GITHUB_WEBHOOK_ALLOWED_REPOSITORIES", "*")
     body = json.dumps(_pr_payload()).encode()
@@ -620,7 +628,7 @@ def test_wildcard_does_not_bypass_allowlist_on_local_url(tmp_path, monkeypatch) 
     )
     registry = SqliteQuestionRegistry(tmp_path / "r.db")
     sink = FakeSink()
-    monkeypatch.setattr(runtime_module, "_runtime", FakeRuntime(registry, sink))
+    runtime_module.install_runtime(FakeRuntime(registry, sink))
     monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", WEBHOOK_SECRET)
     monkeypatch.setenv("GITHUB_WEBHOOK_ALLOWED_REPOSITORIES", "*")
     body = json.dumps(_pr_payload()).encode()
@@ -638,7 +646,7 @@ def test_wildcard_does_not_bypass_allowlist_on_local_url(tmp_path, monkeypatch) 
 def test_edited_pull_request_action_is_ignored(tmp_path, monkeypatch) -> None:
     registry = SqliteQuestionRegistry(tmp_path / "r.db")
     sink = FakeSink()
-    monkeypatch.setattr(runtime_module, "_runtime", FakeRuntime(registry, sink))
+    runtime_module.install_runtime(FakeRuntime(registry, sink))
     monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", WEBHOOK_SECRET)
     payload = _pr_payload()
     payload["action"] = "edited"
@@ -672,7 +680,7 @@ def test_webhook_request_size_is_bounded(monkeypatch) -> None:
 def test_webhook_comment_size_is_bounded(tmp_path, monkeypatch) -> None:
     registry = SqliteQuestionRegistry(tmp_path / "r.db")
     sink = FakeSink()
-    monkeypatch.setattr(runtime_module, "_runtime", FakeRuntime(registry, sink))
+    runtime_module.install_runtime(FakeRuntime(registry, sink))
     monkeypatch.setenv("GITHUB_TOKEN", "x")
     monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", WEBHOOK_SECRET)
     monkeypatch.setattr("kojutsu.webhook.server.GitHubClient", FakeGitHubClient)
@@ -739,7 +747,7 @@ def _review_payload(
 def _review_runtime(tmp_path, monkeypatch) -> FakeSink:
     registry = SqliteQuestionRegistry(tmp_path / "r.db")
     sink = FakeSink()
-    monkeypatch.setattr(runtime_module, "_runtime", FakeRuntime(registry, sink))
+    runtime_module.install_runtime(FakeRuntime(registry, sink))
     monkeypatch.setenv("GITHUB_TOKEN", "x")
     monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", WEBHOOK_SECRET)
     return sink
@@ -969,7 +977,7 @@ def test_review_from_the_change_author_is_not_labelled_independent(tmp_path, mon
 def test_synchronize_supersedes_outstanding_questions_for_the_pr(tmp_path, monkeypatch) -> None:
     registry = SqliteQuestionRegistry(tmp_path / "r.db")
     sink = FakeSink()
-    monkeypatch.setattr(runtime_module, "_runtime", FakeRuntime(registry, sink))
+    runtime_module.install_runtime(FakeRuntime(registry, sink))
     monkeypatch.setenv("GITHUB_TOKEN", "x")
     monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", WEBHOOK_SECRET)
     registry.record_question(
@@ -1011,7 +1019,7 @@ def test_synchronize_supersedes_outstanding_questions_for_the_pr(tmp_path, monke
 def test_synchronize_leaves_an_answered_question_alone(tmp_path, monkeypatch) -> None:
     """A captured decision about a real diff is evidence, not queue clutter."""
     registry = SqliteQuestionRegistry(tmp_path / "r.db")
-    monkeypatch.setattr(runtime_module, "_runtime", FakeRuntime(registry, FakeSink()))
+    runtime_module.install_runtime(FakeRuntime(registry, FakeSink()))
     monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", WEBHOOK_SECRET)
     registry.record_question(
         question_id="q1",
@@ -1045,7 +1053,7 @@ def test_the_same_inline_comment_cannot_be_captured_twice(tmp_path, monkeypatch)
     """
     registry = SqliteQuestionRegistry(tmp_path / "r.db")
     sink = FakeSink()
-    monkeypatch.setattr(runtime_module, "_runtime", FakeRuntime(registry, sink))
+    runtime_module.install_runtime(FakeRuntime(registry, sink))
     monkeypatch.setenv("GITHUB_TOKEN", "x")
     monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", WEBHOOK_SECRET)
     comment = {
@@ -1077,9 +1085,7 @@ def test_the_same_inline_comment_cannot_be_captured_twice(tmp_path, monkeypatch)
     # is refused.
     assert second.json()["records"] == 1
     assert (
-        registry._db.execute(
-            "SELECT COUNT(*) FROM review_captures WHERE comment_id = 901"
-        ).fetchone()[0]
+        query_value(registry.path, "SELECT COUNT(*) FROM review_captures WHERE comment_id = 901")
         == 1
     )
 
@@ -1088,7 +1094,7 @@ def test_a_live_review_claim_refuses_a_second_claimant(tmp_path, monkeypatch) ->
     """A held claim blocks a concurrent capture of the same review."""
     registry = SqliteQuestionRegistry(tmp_path / "r.db")
     sink = FakeSink()
-    monkeypatch.setattr(runtime_module, "_runtime", FakeRuntime(registry, sink))
+    runtime_module.install_runtime(FakeRuntime(registry, sink))
     monkeypatch.setenv("GITHUB_TOKEN", "x")
     monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", WEBHOOK_SECRET)
     review_id = 900
@@ -1122,9 +1128,11 @@ def test_a_live_review_claim_refuses_a_second_claimant(tmp_path, monkeypatch) ->
     assert verdicts == [], "a live claim must block the same review being written twice"
     # One claim row for the held verdict, plus one for the inline comment.
     assert (
-        registry._db.execute(
-            "SELECT COUNT(*) FROM review_captures WHERE review_event_id = ?", (live_id,)
-        ).fetchone()[0]
+        query_value(
+            registry.path,
+            "SELECT COUNT(*) FROM review_captures WHERE review_event_id = ?",
+            (live_id,),
+        )
         == 1
     )
 
@@ -1133,7 +1141,7 @@ def test_an_expired_review_claim_can_be_reclaimed(tmp_path, monkeypatch) -> None
     """A dead claimant must not strand a review forever."""
     registry = SqliteQuestionRegistry(tmp_path / "r.db")
     sink = FakeSink()
-    monkeypatch.setattr(runtime_module, "_runtime", FakeRuntime(registry, sink))
+    runtime_module.install_runtime(FakeRuntime(registry, sink))
     monkeypatch.setenv("GITHUB_TOKEN", "x")
     monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", WEBHOOK_SECRET)
     stale = registry.claim_review_capture(
@@ -1146,11 +1154,11 @@ def test_an_expired_review_claim_can_be_reclaimed(tmp_path, monkeypatch) -> None
         author="reviewer",
     )
     assert stale is not None
-    registry._db.execute(
+    execute_write(
+        registry.path,
         "UPDATE review_captures SET lease_expires_at = ? WHERE review_event_id = ?",
         ("2000-01-01T00:00:00+00:00", "review:stale"),
     )
-    registry._db.commit()
 
     # The stale claim used a different event id, so the fresh one is not blocked.
     response = _post_signed(_review_payload(), "pull_request_review")

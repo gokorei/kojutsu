@@ -93,28 +93,24 @@ def test_jira_from_settings() -> None:
 
     client = JiraClient.from_settings(S())  # type: ignore[arg-type]
     try:
-        assert client._base == "https://jira.test"
+        assert client.base_url == "https://jira.test"
     finally:
         client.close()
 
 
 def test_jira_retry_after_and_backoff_branches(monkeypatch) -> None:
-    client = JiraClient("https://jira.test", "u", "t", sleep=lambda s: None)
-    try:
-        assert (
-            client._retry_after_seconds(
-                httpx.Response(429, headers={"retry-after": "2"}) or httpx.Response(200)
-            )
-            in (None, 2.0)
-            or True
+    assert (
+        jira_module.jira_retry_after_seconds(
+            httpx.Response(429, headers={"retry-after": "2"}) or httpx.Response(200)
         )
-        r = httpx.Response(429, headers={"retry-after": "120"})
-        assert client._backoff(r, 1) == pytest.approx(5.0)
-        bad = httpx.Response(429, headers={"retry-after": "nonsense"})
-        assert client._backoff(bad, 1) <= 5.0
-        assert client._backoff(None, 1) <= 5.0
-    finally:
-        client.close()
+        in (None, 2.0)
+        or True
+    )
+    r = httpx.Response(429, headers={"retry-after": "120"})
+    assert jira_module.jira_backoff(r, 1) == pytest.approx(5.0)
+    bad = httpx.Response(429, headers={"retry-after": "nonsense"})
+    assert jira_module.jira_backoff(bad, 1) <= 5.0
+    assert jira_module.jira_backoff(None, 1) <= 5.0
 
 
 def _route(handler) -> GitHubWebhookClient:
@@ -320,8 +316,7 @@ def test_relay_interval_branches() -> None:
 def test_relay_shutdown_timeout_expires() -> None:
     async def main() -> bool:
         task = asyncio.create_task(asyncio.sleep(5.0))
-        relay_worker._active_relay_tasks.add(task)
-        task.add_done_callback(relay_worker._active_relay_tasks.discard)
+        relay_worker.track_relay_task(task)
         try:
             return await relay_worker.wait_for_relay_shutdown(timeout_seconds=0.01)
         finally:

@@ -34,7 +34,14 @@ deployment is a set of secrets you hold plus two plaintext SQLite files:
   `GITHUB_WEBHOOK_SECRET` and an explicit
   `GITHUB_WEBHOOK_ALLOWED_REPOSITORIES` list. The `*` wildcard is for
   local URLs only. Keep `/webhook/status` on a trusted interface; it
-  exposes operational paths and health.
+  exposes operational paths and health. Set `STATUS_TOKEN` to separate
+  status reads from webhook signing; otherwise the webhook secret is the
+  status bearer. Unauthenticated readiness (`/webhook/ready`) and webhook
+  POST failures return a generic body; details are in server logs and the
+  authed status endpoint.
+- **Dev console:** loopback binds are unauthenticated unless
+  `DEV_CONSOLE_TOKEN` is set. On a multi-user host, set it even for
+  `127.0.0.1`.
 - **LLM boundary:** external providers (OpenAI, Anthropic) require both
   `LLM_EXTERNAL_ENABLED=true` and an explicit
   `LLM_ALLOWED_REPOSITORIES` list. Diffs sent across that boundary are
