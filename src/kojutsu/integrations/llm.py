@@ -339,15 +339,73 @@ _LIKELY_SECRET_PATTERNS = (
         "credential-bearing connection string",
         re.compile(r"\b[a-z][a-z0-9+.-]*://[^\s:/@]+:[^\s/@]+@", re.I),
     ),
-    (
-        "credential assignment",
-        re.compile(
-            r"(?i)\b(aws(?:_|-)?(?:secret(?:_access)?_key|secret_key)|api[_-]?key"
-            r"|access[_-]?token|auth(?:orization)?|password|passwd|pwd|client[_-]?secret"
-            r"|private[_-]?key|token|credential|secret)\b\s*[:=]\s*[^\s,;]{4,}"
-        ),
-    ),
 )
+
+#: A credential-named key followed by an assignment or a colon. Only a candidate: what
+#: follows decides, in :func:`_is_literal_credential`. Matching the key alone refused a
+#: pull request for ``token = f"{page}"``, ``credential=self.parseCredential()``,
+#: ``secret: dict`` or ``auth: inherit``, which is most code that handles credentials at
+#: all, and a refusal costs the whole change rather than one line.
+_CREDENTIAL_ASSIGNMENT = re.compile(
+    r"(?i)\b(?:aws(?:_|-)?(?:secret(?:_access)?_key|secret_key)|api[_-]?key"
+    r"|access[_-]?token|auth(?:orization)?|password|passwd|pwd|client[_-]?secret"
+    # The value is captured in a lookahead so the match ends at the separator, and a
+    # second key later on the same line is still examined.
+    r"|private[_-]?key|token|credential|secret)\b\s*[:=]\s*(?=(?P<value>[^\n]*))"
+)
+_QUOTED_LITERAL = re.compile(r"(?i)(?P<prefix>[rbuf]{0,2})(?P<quote>[\"'])(?P<body>.*?)(?P=quote)")
+#: A value that names where the secret lives instead of being it: a shell or
+#: environment variable, a template slot, or an angle-bracket placeholder.
+_REFERENCE_SIGIL = re.compile(r"^(?:\$\{?\w|\{\{|%\w+%|<[\w -]+>)")
+#: A Python name, dotted or not, optionally called, indexed or annotated with a
+#: generic: ``secret``, ``settings.API_KEY``, ``self.parseCredential(``, ``Token[``.
+_EXPRESSION = re.compile(r"^[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*(?P<tail>[(\[.]?)")
+#: An authorization scheme word, which is followed by the credential rather than being it.
+_AUTH_SCHEME = re.compile(r"(?i)^(?:bearer|basic|token|digest)\s+(?P<rest>.*)")
+#: A quoted value that reads as a name or a sentence rather than a secret: letters
+#: only (``"apiKey"``, ``"authToken"``), or words separated by spaces (``"not empty"``).
+_PLACEHOLDER_LITERAL = re.compile(r"^(?:[A-Za-z_]{1,23}|[\w'-]+(?: [\w'-]+)+)$")
+#: The unquoted value itself, up to the punctuation that ends it in code or config.
+_VALUE_TOKEN = re.compile(r"[^\s,;)\]}]*")
+
+
+def _is_literal_credential(value: str) -> bool:
+    """Whether the text after ``key=`` or ``key:`` is itself a credential.
+
+    Fails closed on anything it does not recognise as a reference: an unquoted
+    ``production-secret-value`` or ``wJalrXUtnFEMI/K7MDENG`` is refused, as is a bare
+    word with a digit in it (``hunter2``), because a variable name and a password are
+    otherwise indistinguishable and the cost of guessing wrong is one-sided. Redaction
+    still runs over everything this lets through.
+    """
+    text = value.strip()
+    if not text or text[0] in "=(":
+        return False  # a comparison (``token == x``) or a grouped expression
+    quoted = _QUOTED_LITERAL.match(text)
+    if quoted:
+        body = quoted.group("body")
+        if "f" in quoted.group("prefix").lower() and "{" in body:
+            return False  # an interpolated f-string is built from other values
+        return len(body) >= 4 and not (
+            _PLACEHOLDER_LITERAL.match(body) or _REFERENCE_SIGIL.match(body)
+        )
+    scheme = _AUTH_SCHEME.match(text)
+    if scheme:
+        return _is_literal_credential(scheme.group("rest"))
+    if _REFERENCE_SIGIL.match(text):
+        return False
+    expression = _EXPRESSION.match(text)
+    if expression:
+        name = expression.group(0)
+        end = expression.end()
+        if expression.group("tail") or end == len(text) or not re.match(r"[\w/+=-]", text[end]):
+            # A call, subscript, attribute or annotation is an expression; a whole bare
+            # name is a variable unless it carries a digit, like most passwords do.
+            return (
+                not expression.group("tail") and "." not in name and any(c.isdigit() for c in name)
+            )
+    token = _VALUE_TOKEN.match(text)
+    return token is not None and len(token.group(0)) >= 4
 
 
 class LLMError(RuntimeError):
@@ -566,12 +624,17 @@ def _source_text(value: Any) -> str:
 
 def _reject_likely_secrets(value: Any) -> None:
     text = _source_text(value)
-    for kind, pattern in _LIKELY_SECRET_PATTERNS:
-        if pattern.search(text):
-            raise LLMConfigurationError(
-                f"Privacy validation blocked a likely {kind} in LLM source data. "
-                "Remove the credential or disable external LLM processing."
-            )
+    kinds = [kind for kind, pattern in _LIKELY_SECRET_PATTERNS if pattern.search(text)]
+    if not kinds and any(
+        _is_literal_credential(match.group("value"))
+        for match in _CREDENTIAL_ASSIGNMENT.finditer(text)
+    ):
+        kinds.append("credential assignment")
+    if kinds:
+        raise LLMConfigurationError(
+            f"Privacy validation blocked a likely {kinds[0]} in LLM source data. "
+            "Remove the credential or disable external LLM processing."
+        )
 
 
 def _redact_sensitive(value: str) -> str:

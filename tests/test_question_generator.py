@@ -135,6 +135,58 @@ class TestParseQuestionsResponse:
         with pytest.raises(LLMConfigurationError, match="Privacy validation blocked"):
             build_questions_prompt(secret, {})
 
+    @pytest.mark.parametrize(
+        "source",
+        [
+            'password = "hunter2"',
+            "password=hunter2",
+            'token="super-secret-value"',
+            "api_key: 'Zx9kQ2mPa7Lw'",
+            "secret = s3cr3t-value",
+            "Authorization: Bearer abc123def456ghi789",
+            "+    accessToken = '4f9a1c2e8b7d'",
+            'HTTPBasicAuth(token=tok, password="hunter2")',
+        ],
+    )
+    def test_prompt_fails_closed_for_literal_credential_assignments(self, source: str) -> None:
+        with pytest.raises(LLMConfigurationError, match="credential assignment"):
+            build_questions_prompt(source, {})
+
+    # Shapes from reviewed pull requests that a key-name-only rule refused outright:
+    # the key is credential-named, the value is code that refers to a credential.
+    @pytest.mark.parametrize(
+        "source",
+        [
+            '+            token = f"{lastPage}-{cursor}"',
+            '+        clientSecret=f"{otherUser.clientSecret}",',
+            "+    token = createTokenForApplicationKey(applicationKey)",
+            "return Authenticate(credential=self.parseCredential(), cardNumber=number)",
+            "token = context.attach(callerContext)",
+            "token = self._cachedToken() or self._newToken()",
+            "+def resetTally(token: Token[Tally | None]) -> None:",
+            "def set(self, path: str, secret: dict, mount_point: str = MOUNT) -> None:",
+            "basic = HTTPBasicAuth(username=key, password=secret)",
+            "return self._call(method=POST, url=url, auth=basicAuth, json=payload)",
+            "api_key = os.environ['API_KEY']",
+            "if token == expected:",
+            "auth: inherit",
+            'curl -X POST "$API_URL" -H "Authorization: Bearer $TOKEN"',
+            "password: ${DB_PASSWORD}",
+            '+            apiKey="apiKey",',
+            '+        settings=ProfileSettings(apiKey="otherApiKey"),',
+            '@patch.object(API, "_getToken", return_value=AuthToken(token="authToken"))',
+            '+    link = createChannelLink(location=location, APIKey="not empty")',
+            '+        APIKey="storeId",',
+        ],
+    )
+    def test_prompt_allows_code_that_refers_to_credentials(self, source: str) -> None:
+        build_questions_prompt(source, {})  # must not raise
+
+    def test_allowed_credential_references_are_still_redacted(self) -> None:
+        prompt = build_questions_prompt("basic = HTTPBasicAuth(username=key, password=secret)", {})
+
+        assert "password=[REDACTED_SECRET]" in prompt
+
     def test_questions_to_models_populates_context(self) -> None:
         questions = questions_to_models(
             [
